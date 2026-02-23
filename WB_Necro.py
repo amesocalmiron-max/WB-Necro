@@ -3187,10 +3187,164 @@ def karma_is_toxic(rating: Optional[float], feedbacks: Optional[int], *, min_fb:
         return False
     return int(feedbacks) >= int(min_fb) and float(rating) < float(min_rating)
 
+
+def _fmt_num(v: Any, nd: int = 2) -> str:
+    if v is None:
+        return "—"
+    try:
+        x = float(v)
+    except Exception:
+        return safe_str(v) or "—"
+    if abs(x - int(x)) < 1e-9:
+        return str(int(x))
+    return f"{x:.{nd}f}"
+
+
+def pulse_explain(cluster_pulse: dict, pulse_rules: Dict[str, Any]) -> Tuple[str, str, List[str], List[str], List[str]]:
+    p = cluster_pulse or {}
+    status, conf, flags = pulse_to_status(p, pulse_rules)
+    rules = pulse_rules or DEFAULT_PULSE_RULES
+    fired: List[str] = []
+    lines: List[str] = []
+
+    imt_n = safe_int(p.get("imt_n"), 0)
+    imt_ok = safe_int(p.get("imt_with_data_n"), 0)
+    unreach_share = safe_float(p.get("unreachable_share"), 0.0) or 0.0
+    lines.append(f"imt_ok={imt_ok}/imt_n={imt_n}, unreachable_share={_fmt_num(unreach_share, 3)}")
+
+    r30 = safe_float(p.get("recent_30_median"), None)
+    r90 = safe_float(p.get("recent_90_median"), None)
+    dsl_min = safe_int(p.get("days_since_last_min"), None)
+    dsl_med = safe_float(p.get("days_since_last_median"), None)
+
+    if status == "UNKNOWN" and unreach_share >= 0.5:
+        fired.append("PULSE_UNKNOWN_UNREACHABLE_50P")
+        lines.append(f"unreachable_share={_fmt_num(unreach_share, 3)} (>=0.5) => UNKNOWN")
+    elif status == "ALIVE":
+        if r30 is not None and dsl_min is not None and r30 >= float(rules.get("alive_r30_med_gte", 1.0)) and dsl_min <= int(rules.get("alive_days_since_last_min_lte", 21)):
+            fired.append("PULSE_ALIVE_R30_DSLMIN")
+            lines.append(
+                f"r30_med={_fmt_num(r30)} (>={_fmt_num(rules.get('alive_r30_med_gte', 1.0))}), "
+                f"dsl_min={_fmt_num(dsl_min)} (<={_fmt_num(rules.get('alive_days_since_last_min_lte', 21), 0)}) => ALIVE"
+            )
+        if r90 is not None and dsl_med is not None and r90 >= float(rules.get("alive_r90_med_gte", 3.0)) and dsl_med <= float(rules.get("alive_days_since_last_med_lte", 45)):
+            fired.append("PULSE_ALIVE_R90_DSLMED")
+            lines.append(
+                f"r90_med={_fmt_num(r90)} (>={_fmt_num(rules.get('alive_r90_med_gte', 3.0))}), "
+                f"dsl_med={_fmt_num(dsl_med)} (<={_fmt_num(rules.get('alive_days_since_last_med_lte', 45))}) => ALIVE"
+            )
+    elif status == "SLOW":
+        fired.append("PULSE_SLOW_R90_DSL")
+        lines.append(f"r90_med={_fmt_num(r90)} dsl_med={_fmt_num(dsl_med)} dsl_min={_fmt_num(dsl_min)} => SLOW")
+    elif status == "DEAD":
+        fired.append("PULSE_DEAD_FALLTHROUGH")
+        lines.append(f"r30_med={_fmt_num(r30)} r90_med={_fmt_num(r90)} dsl_min={_fmt_num(dsl_min)} dsl_med={_fmt_num(dsl_med)} => DEAD")
+    else:
+        fired.append("PULSE_UNKNOWN_FALLTHROUGH")
+
+    for fl in (flags or []):
+        if fl == "REVIEWS_UNREACHABLE":
+            fired.append("PULSE_FLAG_REVIEWS_UNREACHABLE")
+        if fl == "LOW_CONFIDENCE":
+            fired.append("PULSE_FLAG_LOW_CONFIDENCE")
+
+    return status, conf, list(dict.fromkeys(flags or [])), list(dict.fromkeys(fired)), lines
+
+
+def supply_explain(cluster_supply: dict, supply_thresholds: Dict[str, Any]) -> Tuple[List[str], List[str], List[str]]:
+    s = cluster_supply or {}
+    price = s.get("price") or {}
+    sellers = s.get("sellers") or {}
+    stock = s.get("stock") or {}
+    flags = [safe_str(x) for x in (s.get("flags") or []) if safe_str(x)]
+    thr = supply_thresholds or DEFAULT_SUPPLY_THRESHOLDS
+    dthr = thr.get("dumping") or {}
+    mthr = thr.get("monopoly") or {}
+
+    p10 = safe_float(price.get("p10"), None)
+    p50 = safe_float(price.get("p50"), None)
+    p90 = safe_float(price.get("p90"), None)
+    ptrim = safe_float(price.get("trimmed_median"), None)
+    outlier = safe_float(price.get("outlier_rate"), None)
+    ratio = (p10 / p50) if (p10 is not None and p50 not in (None, 0)) else None
+
+    unique_sellers = safe_int(sellers.get("unique"), None)
+    top1 = safe_float(sellers.get("top1_share"), None)
+    hhi = safe_float(sellers.get("hhi"), None)
+    qty_med = safe_float(stock.get("qty_median"), None)
+    qty_n = safe_int(stock.get("qty_n"), None)
+    n = safe_int(s.get("n"), 0)
+
+    lines: List[str] = [
+        f"price: n={_fmt_num(n,0)} p10={_fmt_num(p10)} p50={_fmt_num(p50)} p90={_fmt_num(p90)} trim_med={_fmt_num(ptrim)} outlier_rate={_fmt_num(outlier,3)}",
+        f"sellers: unique={_fmt_num(unique_sellers,0)} top1_share={_fmt_num(top1,3)} hhi={_fmt_num(hhi,3)}",
+        f"stock: qty_median={_fmt_num(qty_med)} qty_n={_fmt_num(qty_n,0)}",
+    ]
+
+    fired: List[str] = []
+    issues = list(dict.fromkeys(flags))
+
+    if "DUMPING_PRESSURE" in flags:
+        fired.append("SUPPLY_DUMPING_FLAG")
+    if ratio is not None and ratio < float(dthr.get("p10_ratio_lt", 0.75)):
+        fired.append("SUPPLY_DUMPING_RATIO")
+        lines.append(f"price: p10/p50={_fmt_num(ratio,3)} (<{_fmt_num(dthr.get('p10_ratio_lt', 0.75),3)}) => DUMPING_PRESSURE")
+    if outlier is not None and outlier >= float(dthr.get("outlier_rate_gte", 0.10)):
+        fired.append("SUPPLY_DUMPING_OUTLIER")
+        lines.append(f"price: outlier_rate={_fmt_num(outlier,3)} (>={_fmt_num(dthr.get('outlier_rate_gte',0.10),3)}) => DUMPING_PRESSURE")
+
+    if "MONOPOLY_DANGER" in flags:
+        fired.append("SUPPLY_MONO_FLAG")
+    if top1 is not None and top1 >= float(mthr.get("top1_share_gte", 0.35)):
+        fired.append("SUPPLY_MONO_TOP1")
+    if hhi is not None and hhi >= float(mthr.get("hhi_gte", 0.25)):
+        fired.append("SUPPLY_MONO_HHI")
+    if "SUPPLY_MONO_TOP1" in fired or "SUPPLY_MONO_HHI" in fired:
+        lines.append(
+            f"sellers: top1={_fmt_num(top1,3)} (>= {_fmt_num(mthr.get('top1_share_gte',0.35),3)}), hhi={_fmt_num(hhi,3)} (>= {_fmt_num(mthr.get('hhi_gte',0.25),3)}) => MONOPOLY_DANGER"
+        )
+
+    return issues, list(dict.fromkeys(fired)), lines
+
+
+def build_backlog_items(verdict: str, issues: List[str], context: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    items: List[Dict[str, Any]] = []
+
+    def add(task: str, prio: int, tag: str, reason: str) -> None:
+        items.append({"task": task, "prio": int(prio), "tag": safe_str(tag), "reason": safe_str(reason)})
+
+    issue_set = set([safe_str(x) for x in (issues or [])])
+
+    if "REVIEWS_UNREACHABLE" in issue_set or "PHONE_MARKET_UNKNOWN" in issue_set or "TYPE_MARKET_UNKNOWN" in issue_set:
+        add("Перезапустить Stage I (reviews) и проверить сетевой контур WB (VPN OFF / endpoint feedbacks1/2).", 1, "data", "Недостаточно достижимых отзывов для уверенного статуса рынка.")
+    if "DUMPING_PRESSURE" in issue_set:
+        add("Пересобрать ценовую стратегию: коридор p10/p50/p90, защита от демпинга, тест комплекта/ценности.", 1, "price", "Обнаружено демпинговое давление по рынку.")
+    if "MONOPOLY_DANGER" in issue_set:
+        add("Сделать дифференциацию оффера: УТП, медиа, комплектация, вариативность, усилить SEO ядро.", 2, "content", "Высокая концентрация продавцов (монополизация).")
+    if "TOXIC_KARMA" in issue_set or verdict == "CLONE_NEW_CARD":
+        add("Клонировать карточку в новый SKU и перезапустить social proof (рейтинг/отзывы) с чистой кармой.", 1, "social", "Токсичная карма текущей карточки.")
+    if "NO_PHONE_MODEL" in issue_set:
+        add("Исправить извлечение phone_model из own-card: ручная нормализация атрибутов/заголовка, затем повтор C->L.", 1, "data", "Не извлечена модель телефона, type-market ненадёжен.")
+
+    if verdict in ("REVIVE_FAST", "REVIVE_REWORK", "CLONE_NEW_CARD"):
+        add("Собрать семантику отдельно для phone-market и type-market (TPU+карман).", 2, "seo", "Нужна связка запросов и контента под два рынка.")
+        add("Обновить карточку: заголовок/описание/характеристики и визуалы под фильтры WB.", 2, "content", "Поддержка ранжирования и конверсии.")
+
+    merged: Dict[str, Dict[str, Any]] = {}
+    for it in items:
+        t = it["task"]
+        if t not in merged or int(it["prio"]) < int(merged[t]["prio"]):
+            merged[t] = it
+    final_items = sorted(merged.values(), key=lambda x: (int(x.get("prio", 9)), safe_str(x.get("tag")), safe_str(x.get("task"))))
+    flat = [safe_str(x.get("task")) for x in final_items]
+    return final_items, flat
+
 def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
     manifest = load_manifest(out_dir)
     run_id = manifest["meta"]["run_id"]
     decision_cfg = ((manifest.get("config") or {}).get("decision") or DEFAULT_DECISION_CFG)
+    pulse_rules = ((manifest.get("config") or {}).get("pulse_rules") or DEFAULT_PULSE_RULES)
+    supply_thresholds = ((manifest.get("config") or {}).get("supply_thresholds") or DEFAULT_SUPPLY_THRESHOLDS)
     intent_map = map_by_nm(out_dir / "intent.jsonl")
     verdict_map = map_by_nm(out_dir / "cluster_verdicts.jsonl")
 
@@ -3222,93 +3376,143 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
         phone_model = safe_str(intent.get("phone_model") or "")
 
         risk_flags: List[str] = []
-        backlog: List[str] = []
         rationale: List[str] = []
-        force_rework = False
+        decision_rules_fired: List[str] = []
+
+        phone_row = by.get("phone") or {}
+        type_row = by.get("type") or {}
+
+        ph_status, ph_conf, ph_pulse_flags, ph_pulse_rules, ph_pulse_lines = pulse_explain(phone_row.get("pulse") or {}, pulse_rules)
+        ph_supply_issues, ph_supply_rules, ph_supply_lines = supply_explain(phone_row.get("supply") or {}, supply_thresholds)
+        phone_status = ph_status or phone_status
+
+        allow_type_check = bool(phone_model.strip())
+        type_skipped = not allow_type_check
+
+        if type_skipped:
+            ty_status, ty_conf = "UNKNOWN", "LOW"
+            ty_pulse_flags, ty_pulse_rules, ty_pulse_lines = ["LOW_CONFIDENCE"], ["TYPE_SKIPPED_NO_PHONE_MODEL"], ["type-market skipped: phone_model отсутствует"]
+            ty_supply_issues, ty_supply_rules, ty_supply_lines = [], [], []
+            risk_flags.append("NO_PHONE_MODEL")
+            decision_rules_fired.append("DECISION_TYPE_SKIPPED_NO_PHONE_MODEL")
+        else:
+            ty_status, ty_conf, ty_pulse_flags, ty_pulse_rules, ty_pulse_lines = pulse_explain(type_row.get("pulse") or {}, pulse_rules)
+            ty_supply_issues, ty_supply_rules, ty_supply_lines = supply_explain(type_row.get("supply") or {}, supply_thresholds)
+            type_status = ty_status or type_status
+
+        all_cluster_issues = sorted(set((phone_row.get("issues") or []) + (type_row.get("issues") or []) + ph_supply_issues + ty_supply_issues + ph_pulse_flags + ty_pulse_flags))
+        risk_flags.extend(all_cluster_issues)
 
         if phone_status == "DEAD":
             verdict = "DROP"
             risk_flags.append("PHONE_MARKET_DEAD")
-            rationale.append("Общий рынок чехлов по модели выглядит мёртвым по пульсу отзывов конкурентов.")
+            decision_rules_fired.append("DECISION_PHONE_DEAD_DROP")
+            rationale.append("PHONE рынок мёртв: решение DROP по цепочке PHONE->FINAL.")
         elif phone_status == "UNKNOWN":
             verdict = "REVIVE_REWORK"
-            risk_flags.append("PHONE_MARKET_UNKNOWN")
-            risk_flags.append("LOW_CONFIDENCE")
-            risk_flags.append("REVIEWS_UNREACHABLE")
-            rationale.append("По рынку модели нет надёжных данных по отзывам (эндпоинт/сеть недоступны). Нельзя честно сказать ALIVE/DEAD.")
-            backlog.append("Пере-запустить Stage I (reviews) с корректной сетью (VPN OFF/РФ IP) или обновить эндпоинт отзывов WB.")
+            risk_flags.extend(["PHONE_MARKET_UNKNOWN", "LOW_CONFIDENCE", "REVIEWS_UNREACHABLE"])
+            decision_rules_fired.append("DECISION_PHONE_UNKNOWN_REWORK")
+            rationale.append("PHONE рынок UNKNOWN: данных недостаточно, требуется повтор Stage I и ручная проверка.")
         else:
-            allow_type_check = True
-            if not phone_model.strip():
-                allow_type_check = False
-                risk_flags.append("NO_PHONE_MODEL")
+            force_rework = False
+            if not allow_type_check:
+                verdict = "REVIVE_REWORK"
                 risk_flags.append("LOW_CONFIDENCE")
-                rationale.append("Модель телефона не извлечена из своей карточки. Оценка type-market (TPU+карман) пропущена, чтобы не ловить мусор по всем моделям.")
-
-            if allow_type_check and type_status == "UNKNOWN":
-                risk_flags.append("TYPE_MARKET_UNKNOWN")
-                risk_flags.append("LOW_CONFIDENCE")
-                risk_flags.append("REVIEWS_UNREACHABLE")
-                rationale.append("Type-market (TPU+карман) не удалось надёжно оценить по отзывам конкурентов. Дальше решение будет с пониженной уверенностью.")
-                force_rework = True
-
-            if allow_type_check and type_status == "DEAD":
+                decision_rules_fired.append("DECISION_NO_PHONE_MODEL_REWORK")
+                rationale.append("Type-market пропущен из-за отсутствия phone_model, решение с пониженной уверенностью.")
+            elif type_status == "DEAD":
                 verdict = "DROP"
                 risk_flags.append("TYPE_MARKET_DEAD")
-                rationale.append("Рынок TPU+карман для этой модели выглядит мёртвым. Оживлять именно этот тип бессмысленно.")
+                decision_rules_fired.append("DECISION_TYPE_DEAD_DROP")
+                rationale.append("TYPE рынок мёртв: для TPU+карман оживление нецелесообразно.")
                 if bool(decision_cfg.get("alt_strategy_on_type_dead", True)):
                     risk_flags.append("ALT_STRATEGY_OTHER_TYPE")
-                    backlog.append("Рассмотреть другой тип чехла для этой модели (без кармана, другой материал/форм‑фактор) вместо TPU+карман.")
-                    rationale.append("При живом общем рынке модели можно попробовать альтернативный тип, а не хоронить SKU целиком.")
-            else:
-                if karma_is_toxic(
-                    rating, feedbacks,
-                    min_fb=int(decision_cfg.get("karma_min_feedbacks", 30) or 30),
-                    min_rating=float(decision_cfg.get("karma_min_rating", 3.7) or 3.7)
-                ):
-                    verdict = "CLONE_NEW_CARD"
-                    risk_flags.append("TOXIC_KARMA")
-                    rationale.append("У текущей карточки токсичная карма (низкий рейтинг при достаточных отзывах). Лучше клонировать в новую карточку.")
-                else:
-                    issues = set((by.get("phone") or {}).get("issues") or [])
-                    if allow_type_check:
-                        issues |= set((by.get("type") or {}).get("issues") or [])
-                    else:
-                        issues.add("LOW_CONFIDENCE")
+                    decision_rules_fired.append("DECISION_ALT_STRATEGY_ON_TYPE_DEAD")
+            elif type_status == "UNKNOWN":
+                force_rework = True
+                risk_flags.extend(["TYPE_MARKET_UNKNOWN", "LOW_CONFIDENCE", "REVIEWS_UNREACHABLE"])
+                decision_rules_fired.append("DECISION_TYPE_UNKNOWN_FORCE_REWORK")
 
-                    if "DUMPING_PRESSURE" in issues or "MONOPOLY_DANGER" in issues:
-                        verdict = "REVIVE_REWORK"
-                        risk_flags.extend(sorted(issues))
-                        rationale.append("Рынок живой, но есть риски структуры (демпинг/монополия). Нужна аккуратная стратегия.")
-                    else:
-                        verdict = "REVIVE_FAST"
-                        rationale.append("Рынок живой и без жёстких флагов. Можно оживлять быстро (SEO+контент+прайс).")
-                        if force_rework:
-                            verdict = "REVIVE_REWORK"
-                            risk_flags.append("LOW_CONFIDENCE")
-                            rationale.append("Из-за UNKNOWN по части рынков понижаю до REVIVE_REWORK (нужна ручная проверка/повтор Stage I).")
-        if verdict in ("REVIVE_FAST", "REVIVE_REWORK", "CLONE_NEW_CARD"):
-            backlog += [
-                "Собрать семантику под модель телефона (общий рынок) и под TPU+карман (тип).",
-                "Проверить конкурентов: фото, заголовок, характеристики, УТП, наличие видео.",
-                "Сделать новый заголовок + описание без переспама, но с ключами.",
-                "Заполнить характеристики под фильтры WB (материал TPU, карман, совместимость).",
-            ]
-        if verdict == "REVIVE_REWORK":
-            backlog += [
-                "Проверить ценовой коридор (p10/p50/p90) и выставить цену без демпинговой истерики.",
-                "Продумать дифференциацию (цвета/комплектация/фото), если рынок забит.",
-            ]
-        if verdict == "CLONE_NEW_CARD":
-            backlog += ["Создать новую карточку и перенести лучшее, но с чистой кармой."]
+            karma_min_fb = int(decision_cfg.get("karma_min_feedbacks", 30) or 30)
+            karma_min_rating = float(decision_cfg.get("karma_min_rating", 3.7) or 3.7)
+            karma_toxic = karma_is_toxic(rating, feedbacks, min_fb=karma_min_fb, min_rating=karma_min_rating)
+
+            if karma_toxic:
+                verdict = "CLONE_NEW_CARD"
+                risk_flags.append("TOXIC_KARMA")
+                decision_rules_fired.append("DECISION_KARMA_TOXIC_CLONE")
+            elif "DUMPING_PRESSURE" in risk_flags or "MONOPOLY_DANGER" in risk_flags:
+                verdict = "REVIVE_REWORK"
+                decision_rules_fired.append("DECISION_SUPPLY_RISK_REWORK")
+            else:
+                verdict = "REVIVE_FAST"
+                decision_rules_fired.append("DECISION_MARKET_OK_FAST")
+                if 'force_rework' in locals() and force_rework:
+                    verdict = "REVIVE_REWORK"
+                    decision_rules_fired.append("DECISION_FORCE_REWORK_LOW_CONFIDENCE")
+
+        rationale.extend([f"PHONE: {x}" for x in (ph_pulse_lines + ph_supply_lines)[:6]])
+        rationale.extend([f"TYPE: {x}" for x in (ty_pulse_lines + ty_supply_lines)[:6]])
+
+        final_because = [
+            f"PHONE={phone_status}({ph_conf})",
+            f"TYPE={type_status}({ty_conf}){' [skipped]' if type_skipped else ''}",
+            f"karma_rating={_fmt_num(rating)} feedbacks={_fmt_num(feedbacks,0)}",
+        ]
+
+        decision_trace = {
+            "phone_model": phone_model,
+            "phone": {
+                "status": phone_status,
+                "confidence": ph_conf,
+                "pulse": phone_row.get("pulse") or {},
+                "supply": phone_row.get("supply") or {},
+                "issues": sorted(set((phone_row.get("issues") or []) + ph_supply_issues + ph_pulse_flags)),
+                "rules_fired": sorted(set(ph_pulse_rules + ph_supply_rules)),
+                "evidence": (ph_pulse_lines + ph_supply_lines)[:10],
+                "skipped": False,
+            },
+            "type": {
+                "status": type_status,
+                "confidence": ty_conf,
+                "pulse": type_row.get("pulse") or {},
+                "supply": type_row.get("supply") or {},
+                "issues": sorted(set((type_row.get("issues") or []) + ty_supply_issues + ty_pulse_flags)),
+                "rules_fired": sorted(set(ty_pulse_rules + ty_supply_rules)),
+                "evidence": (ty_pulse_lines + ty_supply_lines)[:10],
+                "skipped": bool(type_skipped),
+            },
+            "karma": {
+                "rating": rating,
+                "feedbacks": feedbacks,
+                "toxic": bool("TOXIC_KARMA" in risk_flags),
+                "thresholds": {
+                    "min_fb": int(decision_cfg.get("karma_min_feedbacks", 30) or 30),
+                    "min_rating": float(decision_cfg.get("karma_min_rating", 3.7) or 3.7),
+                },
+            },
+            "final": {
+                "verdict": verdict,
+                "because": final_because,
+            },
+        }
+
+        backlog_items, backlog_flat = build_backlog_items(verdict, sorted(set(risk_flags)), {
+            "phone_status": phone_status,
+            "type_status": type_status,
+            "phone_model": phone_model,
+        })
 
         out_rec = {
             "meta": make_meta(run_id, "L", nm, vendor_code, name),
             "decision": {
                 "verdict": verdict,
                 "risk_flags": sorted(set(risk_flags)),
-                "backlog": backlog[:18],
-                "rationale": rationale[:8],
+                "backlog": backlog_flat[:18],
+                "rationale": rationale[:14],
+                "rules_fired": sorted(set(ph_pulse_rules + ph_supply_rules + ty_pulse_rules + ty_supply_rules + decision_rules_fired)),
+                "decision_trace": decision_trace,
+                "backlog_items": backlog_items,
                 "market": {"phone": phone_status, "type": type_status},
                 "karma": {"rating": rating, "feedbacks": feedbacks},
             },
@@ -3340,12 +3544,17 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     manifest = load_manifest(out_dir)
     run_id = manifest["meta"]["run_id"]
     scope = scope_from_manifest(manifest)
+    pulse_rules = ((manifest.get("config") or {}).get("pulse_rules") or DEFAULT_PULSE_RULES)
+    supply_thresholds = ((manifest.get("config") or {}).get("supply_thresholds") or DEFAULT_SUPPLY_THRESHOLDS)
+    decision_cfg = ((manifest.get("config") or {}).get("decision") or DEFAULT_DECISION_CFG)
 
     intent_map = map_by_nm(out_dir / "intent.jsonl")
     cluster_map = map_by_nm(out_dir / "cluster_verdicts.jsonl")
     decision_map = map_by_nm(out_dir / "decisions.jsonl")
 
     rows: List[Dict[str, Any]] = []
+    evidence_market_rows: List[Dict[str, Any]] = []
+    evidence_supply_rows: List[Dict[str, Any]] = []
     for sku in scope:
         nm = nm_id_to_str(sku.get("nm_id"))
         vc = safe_str(sku.get("vendor_code", ""))
@@ -3365,6 +3574,11 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         flags = ", ".join(dec.get("risk_flags") or [])
         rationale = " | ".join(dec.get("rationale") or [])
         backlog = "\n".join([f"• {x}" for x in (dec.get("backlog") or [])])
+        rules_fired = dec.get("rules_fired") if isinstance(dec.get("rules_fired"), list) else []
+        decision_trace = dec.get("decision_trace") if isinstance(dec.get("decision_trace"), dict) else {}
+
+        ev_phone = decision_trace.get("phone") if isinstance(decision_trace.get("phone"), dict) else (cv_by.get("phone") or {})
+        ev_type = decision_trace.get("type") if isinstance(decision_trace.get("type"), dict) else (cv_by.get("type") or {})
 
         def _ms(cluster: str) -> str:
             return safe_str((cv_by.get(cluster) or {}).get("market_status") or "")
@@ -3386,8 +3600,51 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             "risk_flags": flags,
             "rationale": rationale,
             "backlog": backlog,
+            "rules_fired": ", ".join([safe_str(x) for x in rules_fired]),
             "url": wb_product_url(nm),
         })
+
+        for cluster, ev in (("phone", ev_phone), ("type", ev_type)):
+            pulse = (ev.get("pulse") or {}) if isinstance(ev, dict) else {}
+            supply = (ev.get("supply") or {}) if isinstance(ev, dict) else {}
+            evidence_market_rows.append({
+                "nm_id": nm,
+                "cluster": cluster,
+                "status": safe_str(ev.get("status") or (cv_by.get(cluster) or {}).get("market_status") or ""),
+                "confidence": safe_str(ev.get("confidence") or (cv_by.get(cluster) or {}).get("confidence") or ""),
+                "imt_n": pulse.get("imt_n"),
+                "imt_with_data_n": pulse.get("imt_with_data_n"),
+                "unreachable_share": pulse.get("unreachable_share"),
+                "imt_unreachable_n": pulse.get("imt_unreachable_n"),
+                "imt_no_reviews_n": pulse.get("imt_no_reviews_n"),
+                "recent_30_median": pulse.get("recent_30_median"),
+                "recent_90_median": pulse.get("recent_90_median"),
+                "days_since_last_min": pulse.get("days_since_last_min"),
+                "days_since_last_median": pulse.get("days_since_last_median"),
+                "rules_fired": ", ".join([safe_str(x) for x in ((ev.get("rules_fired") or []) if isinstance(ev, dict) else [])]),
+                "issues": ", ".join([safe_str(x) for x in ((ev.get("issues") or []) if isinstance(ev, dict) else [])]),
+            })
+
+            sp = (supply.get("price") or {}) if isinstance(supply, dict) else {}
+            ss = (supply.get("sellers") or {}) if isinstance(supply, dict) else {}
+            st = (supply.get("stock") or {}) if isinstance(supply, dict) else {}
+            evidence_supply_rows.append({
+                "nm_id": nm,
+                "cluster": cluster,
+                "n": supply.get("n") if isinstance(supply, dict) else None,
+                "p10": sp.get("p10"),
+                "p50": sp.get("p50"),
+                "p90": sp.get("p90"),
+                "trimmed_median": sp.get("trimmed_median"),
+                "outlier_rate": sp.get("outlier_rate"),
+                "unique_sellers": ss.get("unique"),
+                "top1_share": ss.get("top1_share"),
+                "hhi": ss.get("hhi"),
+                "qty_median": st.get("qty_median"),
+                "qty_n": st.get("qty_n"),
+                "flags": ", ".join([safe_str(x) for x in ((supply.get("flags") or []) if isinstance(supply, dict) else [])]),
+                "rules_fired": ", ".join([safe_str(x) for x in ((ev.get("rules_fired") or []) if isinstance(ev, dict) else []) if safe_str(x).startswith("SUPPLY_")]),
+            })
 
     verdict_order = {"REVIVE_FAST": 0, "REVIVE_REWORK": 1, "CLONE_NEW_CARD": 2, "DROP": 3}
     rows.sort(key=lambda r: (verdict_order.get(safe_str(r.get("verdict")), 99), safe_str(r.get("nm_id"))))
@@ -3505,6 +3762,42 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             ws3[f"A{k}"] = f"- {safe_str(x)}"
         autosize_columns(ws3)
 
+    ws_ev_m = wb.create_sheet("EVIDENCE_MARKET")
+    ev_m_headers = [
+        "nm_id", "cluster", "status", "confidence",
+        "imt_n", "imt_with_data_n", "unreachable_share", "imt_unreachable_n", "imt_no_reviews_n",
+        "recent_30_median", "recent_90_median", "days_since_last_min", "days_since_last_median",
+        "rules_fired", "issues",
+    ]
+    ws_ev_m.append(ev_m_headers)
+    for rr in evidence_market_rows:
+        ws_ev_m.append([rr.get(h) for h in ev_m_headers])
+    autosize_columns(ws_ev_m)
+
+    ws_ev_s = wb.create_sheet("EVIDENCE_SUPPLY")
+    ev_s_headers = [
+        "nm_id", "cluster", "n", "p10", "p50", "p90", "trimmed_median", "outlier_rate",
+        "unique_sellers", "top1_share", "hhi", "qty_median", "qty_n", "flags", "rules_fired",
+    ]
+    ws_ev_s.append(ev_s_headers)
+    for rr in evidence_supply_rows:
+        ws_ev_s.append([rr.get(h) for h in ev_s_headers])
+    autosize_columns(ws_ev_s)
+
+    ws_thr = wb.create_sheet("THRESHOLDS")
+    ws_thr.append(["key", "value"])
+    for k, v in sorted((pulse_rules or {}).items()):
+        ws_thr.append([f"pulse_rules.{k}", safe_str(v)])
+    for k, v in sorted((supply_thresholds or {}).items()):
+        if isinstance(v, dict):
+            for kk, vv in sorted(v.items()):
+                ws_thr.append([f"supply_thresholds.{k}.{kk}", safe_str(vv)])
+        else:
+            ws_thr.append([f"supply_thresholds.{k}", safe_str(v)])
+    ws_thr.append(["decision.karma_min_feedbacks", safe_str(decision_cfg.get("karma_min_feedbacks"))])
+    ws_thr.append(["decision.karma_min_rating", safe_str(decision_cfg.get("karma_min_rating"))])
+    autosize_columns(ws_thr)
+
     wb.save(str(out_xlsx))
 
     out_html = out_dir / "WB_NECROMANCER_REPORT.html"
@@ -3548,6 +3841,63 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             )
         return "".join(items) if items else "<div class='muted'>Нет данных</div>"
 
+    def _kv_line(label: str, data: Dict[str, Any], keys: List[str]) -> str:
+        vals = [f"{k}={_fmt_num(data.get(k), 3) if isinstance(data.get(k), (int, float)) else (safe_str(data.get(k)) or '—')}" for k in keys]
+        return f"<div class='muted'><b>{_html.escape(label)}:</b> {_html.escape(' | '.join(vals))}</div>"
+
+    def _render_evidence(cluster: str, trace_cluster: dict, fallback_cluster: dict) -> str:
+        tc = trace_cluster if isinstance(trace_cluster, dict) else {}
+        fb = fallback_cluster if isinstance(fallback_cluster, dict) else {}
+        status = safe_str(tc.get("status") or fb.get("market_status") or "UNKNOWN")
+        conf = safe_str(tc.get("confidence") or fb.get("confidence") or "LOW")
+        pulse = tc.get("pulse") if isinstance(tc.get("pulse"), dict) else (fb.get("pulse") or {})
+        supply = tc.get("supply") if isinstance(tc.get("supply"), dict) else (fb.get("supply") or {})
+        issues = tc.get("issues") if isinstance(tc.get("issues"), list) else (fb.get("issues") or [])
+        rules = tc.get("rules_fired") if isinstance(tc.get("rules_fired"), list) else []
+
+        pkeys = ["imt_n", "imt_with_data_n", "unreachable_share", "recent_30_median", "recent_90_median", "days_since_last_min", "days_since_last_median"]
+        skeys = ["n"]
+        price = supply.get("price") if isinstance(supply.get("price"), dict) else {}
+        sellers = supply.get("sellers") if isinstance(supply.get("sellers"), dict) else {}
+        stock = supply.get("stock") if isinstance(supply.get("stock"), dict) else {}
+
+        tags = " ".join([f"<span class='tag t-top'>{_html.escape(safe_str(x))}</span>" for x in rules[:8]]) or "<span class='muted'>—</span>"
+        issues_html = " ".join([f"<span class='tag c-{_flag_category(safe_str(x))}'>{_html.escape(safe_str(x))}</span>" for x in issues[:8]]) or "<span class='muted'>—</span>"
+
+        body = (
+            _kv_line("Pulse", pulse if isinstance(pulse, dict) else {}, pkeys)
+            + _kv_line("Supply", {"n": supply.get("n") if isinstance(supply, dict) else None}, skeys)
+            + _kv_line("Price", price, ["p10", "p50", "p90", "trimmed_median", "outlier_rate"])
+            + _kv_line("Sellers", sellers, ["unique", "top1_share", "hhi"])
+            + _kv_line("Stock", stock, ["qty_median", "qty_n"])
+            + f"<div><b>Rules fired:</b> {tags}</div>"
+            + f"<div><b>Issues:</b> {issues_html}</div>"
+        )
+        return f"<details><summary>{_html.escape(cluster.upper())}: {_html.escape(status)} ({_html.escape(conf)})</summary>{body}</details>"
+
+    def validate_report_rows(rows_data: List[Dict[str, Any]], decision_mp: Dict[str, Any], cluster_mp: Dict[str, Any]) -> None:
+        for rr in rows_data:
+            nm = safe_str(rr.get("nm_id"))
+            dec = ((decision_mp.get(nm) or {}).get("decision") or {})
+            cv = ((cluster_mp.get(nm) or {}).get("cluster_verdicts") or [])
+            tr = dec.get("decision_trace") if isinstance(dec.get("decision_trace"), dict) else {}
+            if safe_str(dec.get("verdict")) and not tr:
+                stage_warn("M", f"[{nm}] verdict есть, но decision_trace пустой (fallback будет ограничен)")
+
+            for cl in cv:
+                if not isinstance(cl, dict):
+                    continue
+                st = safe_str(cl.get("market_status"))
+                pulse = cl.get("pulse") or {}
+                supply = cl.get("supply") or {}
+                flags = (supply.get("flags") or []) if isinstance(supply, dict) else []
+                if st == "UNKNOWN" and (pulse.get("unreachable_share") is None):
+                    stage_warn("M", f"[{nm}:{safe_str(cl.get('cluster'))}] status UNKNOWN, но unreachable_share отсутствует")
+                if "DUMPING_PRESSURE" in flags:
+                    pr = (supply.get("price") or {}) if isinstance(supply, dict) else {}
+                    if pr.get("p10") is None or pr.get("p50") is None:
+                        stage_warn("M", f"[{nm}:{safe_str(cl.get('cluster'))}] DUMPING_PRESSURE без p10/p50")
+
     html_rows = []
     for r in rows:
         rid = _html.escape(safe_str(r.get("nm_id")))
@@ -3565,6 +3915,16 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         backlog_text = "\n".join(backlog_lines)
         rationale_text = "\n".join(rationale_lines)
 
+        nm_key = safe_str(r.get("nm_id"))
+        dec_trace = (((decision_map.get(nm_key) or {}).get("decision") or {}).get("decision_trace") or {})
+        if not isinstance(dec_trace, dict):
+            dec_trace = {}
+        trace_phone = dec_trace.get("phone") if isinstance(dec_trace.get("phone"), dict) else {}
+        trace_type = dec_trace.get("type") if isinstance(dec_trace.get("type"), dict) else {}
+        cv_rows = (cluster_map.get(nm_key, {}).get("cluster_verdicts") or [])
+        cv_by_local = {safe_str(x.get("cluster")): x for x in cv_rows if isinstance(x, dict)}
+        evidence_html = _render_evidence("phone", trace_phone, cv_by_local.get("phone") or {}) + _render_evidence("type", trace_type, cv_by_local.get("type") or {})
+
         html_rows.append(f"""
 <tr class="row" data-nm="{rid}" data-verdict="{_html.escape(verdict)}" data-cats="{_html.escape(cat_attr)}">
   <td>
@@ -3580,6 +3940,7 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     <div><b>market:</b> {_html.escape(safe_str(r.get("market_phone")))} / {_html.escape(safe_str(r.get("market_type")))}</div>
     <div class="muted">rating={_html.escape(safe_str(r.get("karma_rating")))} • fb={_html.escape(safe_str(r.get("karma_feedbacks")))}</div>
   </td>
+  <td>{evidence_html}</td>
   <td>{flags_html}</td>
   <td><details><summary>Почему так</summary><pre>{_html.escape(rationale_text)}</pre></details></td>
   <td><details><summary>Что делать</summary><pre>{_html.escape(backlog_text)}</pre></details></td>
@@ -3753,7 +4114,7 @@ applyFilters();
 {evidence_block}
 <table>
 <thead><tr>
-<th style='width:140px'>SKU</th><th>Товар</th><th style='width:130px'>Вердикт</th><th style='width:200px'>Состояние</th><th style='width:260px'>Флаги</th><th style='width:200px'>Обоснование</th><th style='width:200px'>Backlog</th>
+<th style='width:140px'>SKU</th><th>Товар</th><th style='width:130px'>Вердикт</th><th style='width:200px'>Состояние</th><th style='width:380px'>Доказательства</th><th style='width:260px'>Флаги</th><th style='width:200px'>Обоснование</th><th style='width:200px'>Backlog</th>
 </tr></thead>
 <tbody>
 {''.join(html_rows)}
@@ -3763,6 +4124,7 @@ applyFilters();
 <script>{js}</script>
 </body></html>
 """
+    validate_report_rows(rows, decision_map, cluster_map)
     out_html.write_text(html_doc, encoding='utf-8')
 
     stage_dbg("M", f"wrote {out_xlsx} + {out_html}")

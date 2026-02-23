@@ -3389,8 +3389,6 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             "url": wb_product_url(nm),
         })
 
-    verdict_order = {"REVIVE_FAST": 0, "REVIVE_REWORK": 1, "CLONE_NEW_CARD": 2, "DROP": 3}
-    rows.sort(key=lambda r: (verdict_order.get(safe_str(r.get("verdict")), 99), safe_str(r.get("nm_id"))))
 
     # ---------- агрегаты для summary/LLM ----------
     from collections import Counter
