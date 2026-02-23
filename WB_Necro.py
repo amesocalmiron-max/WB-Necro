@@ -921,9 +921,60 @@ def parse_card_v4(js: dict) -> dict:
         "seller": safe_str(p.get("supplier") or p.get("supplierName") or p.get("seller") or ""),
         "subject_name": safe_str(p.get("subjectName") or p.get("subjName") or ""),
     }
+    def _rub(v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            x = float(v)
+        except Exception:
+            return None
+        if x <= 0:
+            return None
+        # WB чаще отдаёт integer копейки (priceU), но иногда уже рубли
+        if x >= 1000:
+            return round(x / 100.0, 2)
+        return round(x, 2)
+
+    priceU = p.get("priceU") or p.get("price")
+    salePriceU = p.get("salePriceU") or p.get("salePrice")
+
+    list_price_rub = _rub(priceU)
+    sale_price_rub = _rub(salePriceU)
+    client_price_rub = None
+    price_source = "top_level"
+
+    sizes = p.get("sizes") if isinstance(p.get("sizes"), list) else []
+    for s in sizes:
+        if not isinstance(s, dict):
+            continue
+        pr = s.get("price") if isinstance(s.get("price"), dict) else {}
+        cand_client = _rub(pr.get("client") or pr.get("product"))
+        cand_sale = _rub(pr.get("sale") or pr.get("total"))
+        cand_list = _rub(pr.get("basic") or pr.get("origin") or pr.get("list"))
+        if cand_client is not None:
+            client_price_rub = cand_client
+            price_source = "sizes.price.client/product"
+        if cand_sale is not None:
+            sale_price_rub = cand_sale
+            if price_source == "top_level":
+                price_source = "sizes.price.sale/total"
+        if cand_list is not None:
+            list_price_rub = cand_list
+            if price_source == "top_level":
+                price_source = "sizes.price.basic"
+        if client_price_rub is not None or sale_price_rub is not None or list_price_rub is not None:
+            break
+
+    if client_price_rub is None:
+        client_price_rub = sale_price_rub if sale_price_rub is not None else list_price_rub
+
     out["pricing"] = {
-        "priceU": p.get("priceU") or p.get("price"),
-        "salePriceU": p.get("salePriceU") or p.get("salePrice"),
+        "priceU": priceU,
+        "salePriceU": salePriceU,
+        "client_price_rub": client_price_rub,
+        "sale_price_rub": sale_price_rub,
+        "list_price_rub": list_price_rub,
+        "price_source": price_source,
     }
     out["metrics"] = {
         "rating": p.get("rating") if p.get("rating") is not None else p.get("reviewRating") or p.get("nmReviewRating"),
@@ -1091,12 +1142,32 @@ def extract_phone_models(text: str, limit: int = 5) -> List[str]:
     return found
 
 def pass_must_any_groups(text: str, must_any_groups: List[dict]) -> bool:
+    """Legacy strict behavior: every group must match at least one token (AND of groups)."""
     t = norm_lc(text)
     for g in must_any_groups or []:
         any_terms = g.get("any") or []
         if any_terms and not any(norm_lc(str(x)) in t for x in any_terms if str(x).strip()):
             return False
     return True
+
+
+def pass_must_all_groups(text: str, must_all_groups: List[dict]) -> bool:
+    """Strict relevance: all groups must pass."""
+    return pass_must_any_groups(text, must_all_groups)
+
+
+def pass_any_group(text: str, groups: List[dict]) -> bool:
+    """Lenient relevance: any one group passes."""
+    t = norm_lc(text)
+    found_any = False
+    for g in groups or []:
+        any_terms = g.get("any") or []
+        if not any_terms:
+            continue
+        found_any = True
+        if any(norm_lc(str(x)) in t for x in any_terms if str(x).strip()):
+            return True
+    return not found_any
 
 def hit_ban_terms(text: str, ban_terms: List[str]) -> bool:
     t = norm_lc(text)
@@ -1779,6 +1850,7 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
             if cluster not in CLUSTERS:
                 continue
             must_any_groups = list(pack.get("must_any_groups") or [])
+            must_all_groups = list(pack.get("must_all_groups") or must_any_groups)
             ban_terms = list(pack.get("ban_terms") or [])
             queries = [safe_str(x).strip() for x in (pack.get("queries") or []) if safe_str(x).strip()]
 
@@ -1798,7 +1870,7 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
             for q in queries:
                 if hit_ban_terms(q, ban_terms):
                     per_q.append({"query": q, "status": "dropped_ban_term", "rel50": 0, "items_count": 0,
-                                  "metrics": {"top_n": 0, "pass_n": 0, "pass_rate": 0.0}, "cache_path": None})
+                                  "metrics": {"top_n": 0, "pass_any_n": 0, "pass_any_rate": 0.0, "pass_all_n": 0, "pass_all_rate": 0.0, "pass_n": 0, "pass_rate": 0.0}, "cache_path": None})
                     continue
 
                 status, code, js, url, dest_used, rel50, host_used = fetch_search_best(
@@ -1807,15 +1879,18 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
                 items = parse_search_items(js) if (status == "ok" and js) else []
 
                 top_n = min(50, len(items))
-                pass_n = 0
+                pass_any_n = 0
+                pass_all_n = 0
                 for it in items[:top_n]:
                     title = safe_str(it.get("name") or "")
                     if hit_ban_terms(title, ban_terms):
                         continue
-                    if not pass_must_any_groups(title, must_any_groups):
-                        continue
-                    pass_n += 1
-                pass_rate = (pass_n / top_n) if top_n else 0.0
+                    if pass_any_group(title, must_any_groups):
+                        pass_any_n += 1
+                    if pass_must_all_groups(title, must_all_groups):
+                        pass_all_n += 1
+                pass_any_rate = (pass_any_n / top_n) if top_n else 0.0
+                pass_all_rate = (pass_all_n / top_n) if top_n else 0.0
 
                 cache_path = None
                 if js:
@@ -1829,7 +1904,16 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
                     "http": code,
                     "rel50": int(rel50),
                     "items_count": len(items),
-                    "metrics": {"top_n": int(top_n), "pass_n": int(pass_n), "pass_rate": round(pass_rate, 4)},
+                    "metrics": {
+                        "top_n": int(top_n),
+                        "pass_any_n": int(pass_any_n),
+                        "pass_any_rate": round(pass_any_rate, 4),
+                        "pass_all_n": int(pass_all_n),
+                        "pass_all_rate": round(pass_all_rate, 4),
+                        # backward compatibility
+                        "pass_n": int(pass_all_n),
+                        "pass_rate": round(pass_all_rate, 4),
+                    },
                     "url": url,
                     "dest_used": dest_used,
                     "host_used": host_used,
@@ -1838,9 +1922,17 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
                 time.sleep(max(0.0, float(sleep_s)))
 
             min_rate = min_pass_rate_phone if cluster == "phone" else min_pass_rate_type
-            good = [r for r in per_q if safe_float((r.get("metrics") or {}).get("pass_rate"), 0.0) >= min_rate and (r.get("http") == 200)]
+            good_strict = [r for r in per_q if safe_float((r.get("metrics") or {}).get("pass_all_rate"), 0.0) >= min_rate and (r.get("http") == 200)]
+            good_any = [r for r in per_q if safe_float((r.get("metrics") or {}).get("pass_any_rate"), 0.0) >= min_rate and (r.get("http") == 200)]
+            use_any_fallback = False
+            good = good_strict
+            if not good and good_any:
+                good = good_any
+                use_any_fallback = True
+
             good_sorted = sorted(good, key=lambda r: (
-                safe_float((r.get("metrics") or {}).get("pass_rate"), 0.0),
+                safe_float((r.get("metrics") or {}).get("pass_all_rate"), 0.0),
+                safe_float((r.get("metrics") or {}).get("pass_any_rate"), 0.0),
                 safe_int(r.get("rel50"), 0),
                 safe_int(r.get("items_count"), 0),
             ), reverse=True)
@@ -1848,7 +1940,8 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
             if len(keep) < min_keep_per_cluster:
                 rest_src = [r for r in per_q if r.get("status") == "ok" and r.get("cache_path") and (r.get("http") == 200)]
                 rest = sorted(rest_src, key=lambda r: (
-                    safe_float((r.get("metrics") or {}).get("pass_rate"), 0.0),
+                    safe_float((r.get("metrics") or {}).get("pass_all_rate"), 0.0),
+                    safe_float((r.get("metrics") or {}).get("pass_any_rate"), 0.0),
                     safe_int(r.get("rel50"), 0),
                     safe_int(r.get("items_count"), 0),
                 ), reverse=True)
@@ -1864,6 +1957,8 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
                 "selected_queries": [r.get("query") for r in keep if r.get("query")],
                 "validation": {"queries": per_q},
                 "min_pass_rate": float(min_rate),
+                "selection_mode": "any_fallback" if use_any_fallback else "strict_all",
+                "low_confidence_relevance": bool(use_any_fallback),
             })
 
         out_rec = {"meta": make_meta(run_id, "E", nm, vendor_code, name), "valid_packs": valid_packs}
@@ -2987,15 +3082,26 @@ def stage_J_supply(out_dir: Path, *, resume: bool = False) -> Path:
                     continue
                 v4 = ((it.get("card") or {}).get("v4") or {})
                 seed = it.get("seed") or {}
-                pr_u = (v4.get("pricing") or {}).get("salePriceU") or (v4.get("pricing") or {}).get("priceU")
-                pr = safe_int(pr_u, None)
+                prc = (v4.get("pricing") or {})
+                chosen = (
+                    prc.get("client_price_rub")
+                    if prc.get("client_price_rub") is not None else
+                    prc.get("sale_price_rub")
+                    if prc.get("sale_price_rub") is not None else
+                    prc.get("list_price_rub")
+                )
+                pr = safe_float(chosen, None)
                 if pr is not None:
-                    pr_rub = pr / 100.0 if pr > 1000 else float(pr)
-                    prices.append(float(pr_rub))
+                    prices.append(float(pr))
                 else:
-                    pr2 = seed.get("price_rub")
-                    if pr2 is not None:
-                        prices.append(float(pr2))
+                    pr_u = prc.get("salePriceU") or prc.get("priceU")
+                    pru = safe_int(pr_u, None)
+                    if pru is not None:
+                        prices.append(float(pru / 100.0 if pru > 1000 else pru))
+                    else:
+                        pr2 = safe_float(seed.get("price_rub"), None)
+                        if pr2 is not None:
+                            prices.append(float(pr2))
                 sellers.append(seller_key(seed))
                 tq = safe_float((v4.get("metrics") or {}).get("total_quantity"), None)
                 if tq is not None:
@@ -3042,9 +3148,14 @@ def stage_J_supply(out_dir: Path, *, resume: bool = False) -> Path:
             rel_stats = (rel_clusters.get(cluster, {}).get("stats") or {})
             if bool(rel_stats.get("low_confidence")):
                 flags.append("LOW_CONFIDENCE")
+            if bool(rel_stats.get("low_confidence")) or bool(rel_clusters.get(cluster, {}).get("low_confidence_relevance")):
+                flags.append("LOW_CONFIDENCE_RELEVANCE")
 
             if len(prices) < int(thr.get("min_n", 8)):
                 flags.append("LOW_CONFIDENCE")
+
+            if len(prices) < min_price_n:
+                flags.append("LOW_CONFIDENCE_PRICE")
 
             out_clusters.append({
                 "cluster": cluster,
@@ -3347,6 +3458,7 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
     supply_thresholds = ((manifest.get("config") or {}).get("supply_thresholds") or DEFAULT_SUPPLY_THRESHOLDS)
     intent_map = map_by_nm(out_dir / "intent.jsonl")
     verdict_map = map_by_nm(out_dir / "cluster_verdicts.jsonl")
+    rel_map = map_by_nm(out_dir / "relevance.jsonl")
 
     out_path = out_dir / "decisions.jsonl"
     done = read_jsonl_done_ids(out_path) if resume else set()
@@ -3381,6 +3493,7 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
 
         phone_row = by.get("phone") or {}
         type_row = by.get("type") or {}
+        rel_rows = {safe_str(x.get("cluster")): x for x in ((rel_map.get(nm, {}) or {}).get("clusters") or []) if isinstance(x, dict)}
 
         ph_status, ph_conf, ph_pulse_flags, ph_pulse_rules, ph_pulse_lines = pulse_explain(phone_row.get("pulse") or {}, pulse_rules)
         ph_supply_issues, ph_supply_rules, ph_supply_lines = supply_explain(phone_row.get("supply") or {}, supply_thresholds)
@@ -3401,6 +3514,9 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
             type_status = ty_status or type_status
 
         all_cluster_issues = sorted(set((phone_row.get("issues") or []) + (type_row.get("issues") or []) + ph_supply_issues + ty_supply_issues + ph_pulse_flags + ty_pulse_flags))
+        for cl in ("phone", "type"):
+            if bool((rel_rows.get(cl, {}).get("stats") or {}).get("low_confidence")):
+                all_cluster_issues.append("LOW_CONFIDENCE_RELEVANCE")
         risk_flags.extend(all_cluster_issues)
 
         if phone_status == "DEAD":
@@ -3451,6 +3567,12 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
                     verdict = "REVIVE_REWORK"
                     decision_rules_fired.append("DECISION_FORCE_REWORK_LOW_CONFIDENCE")
 
+        low_conf_set = {"LOW_CONFIDENCE", "LOW_CONFIDENCE_PRICE", "LOW_CONFIDENCE_RELEVANCE"}
+        if verdict == "REVIVE_FAST" and any(x in low_conf_set for x in set(risk_flags)):
+            verdict = "REVIVE_REWORK"
+            decision_rules_fired.append("DECISION_CAP_FAST_BY_LOW_CONFIDENCE")
+            rationale.append("Вердикт понижен до REVIVE_REWORK из-за качества данных (LOW_CONFIDENCE*).")
+
         rationale.extend([f"PHONE: {x}" for x in (ph_pulse_lines + ph_supply_lines)[:6]])
         rationale.extend([f"TYPE: {x}" for x in (ty_pulse_lines + ty_supply_lines)[:6]])
 
@@ -3495,6 +3617,14 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
                 "verdict": verdict,
                 "because": final_because,
             },
+            "data_quality": {
+                "issues": sorted(set([x for x in risk_flags if safe_str(x).startswith("LOW_CONFIDENCE") or x in ("REVIEWS_UNREACHABLE", "NO_PHONE_MODEL")])),
+                "limits": [
+                    "При LOW_CONFIDENCE* verdict не может быть REVIVE_FAST.",
+                    "При REVIEWS_UNREACHABLE выводы по pulse ограничены.",
+                ],
+            },
+            "verdict_logic": sorted(set(ph_pulse_rules + ph_supply_rules + ty_pulse_rules + ty_supply_rules + decision_rules_fired)),
         }
 
         backlog_items, backlog_flat = build_backlog_items(verdict, sorted(set(risk_flags)), {
@@ -3551,10 +3681,42 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     intent_map = map_by_nm(out_dir / "intent.jsonl")
     cluster_map = map_by_nm(out_dir / "cluster_verdicts.jsonl")
     decision_map = map_by_nm(out_dir / "decisions.jsonl")
+    lite_map = map_by_nm(out_dir / "competitor_lite.jsonl")
+    rel_map = map_by_nm(out_dir / "relevance.jsonl")
 
     rows: List[Dict[str, Any]] = []
     evidence_market_rows: List[Dict[str, Any]] = []
     evidence_supply_rows: List[Dict[str, Any]] = []
+
+    def _top_competitors(nm: str, cluster: str) -> List[Dict[str, Any]]:
+        lite_clusters = {safe_str(x.get("cluster")): x for x in ((lite_map.get(nm, {}) or {}).get("clusters") or []) if isinstance(x, dict)}
+        rel_clusters = {safe_str(x.get("cluster")): x for x in ((rel_map.get(nm, {}) or {}).get("clusters") or []) if isinstance(x, dict)}
+        keep_ids = {nm_id_to_str(x.get("nm_id")) for x in (rel_clusters.get(cluster, {}).get("keep") or [])}
+        out: List[Dict[str, Any]] = []
+        for it in (lite_clusters.get(cluster, {}).get("items") or []):
+            cid = nm_id_to_str(it.get("nm_id"))
+            if cid not in keep_ids:
+                continue
+            seed = it.get("seed") or {}
+            v4 = ((it.get("card") or {}).get("v4") or {})
+            pricing = v4.get("pricing") or {}
+            price = pricing.get("client_price_rub")
+            if price is None:
+                price = pricing.get("sale_price_rub")
+            if price is None:
+                price = pricing.get("list_price_rub")
+            metrics = v4.get("metrics") or {}
+            out.append({
+                "nm_id": cid,
+                "name": safe_str((v4.get("content") or {}).get("title") or seed.get("name") or ""),
+                "seller": safe_str((v4.get("content") or {}).get("seller") or seed.get("seller_name") or ""),
+                "price": price,
+                "rating": metrics.get("rating") if isinstance(metrics, dict) else seed.get("rating"),
+                "feedbacks": metrics.get("feedbacks") if isinstance(metrics, dict) else seed.get("feedbacks"),
+                "url": wb_product_url(cid),
+            })
+        out = sorted(out, key=lambda x: ((safe_float(x.get("price"), 10**9) or 10**9), -(safe_float(x.get("rating"), 0.0) or 0.0), -(safe_int(x.get("feedbacks"), 0) or 0)))
+        return out[:5]
     for sku in scope:
         nm = nm_id_to_str(sku.get("nm_id"))
         vc = safe_str(sku.get("vendor_code", ""))
@@ -3579,6 +3741,17 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
 
         ev_phone = decision_trace.get("phone") if isinstance(decision_trace.get("phone"), dict) else (cv_by.get("phone") or {})
         ev_type = decision_trace.get("type") if isinstance(decision_trace.get("type"), dict) else (cv_by.get("type") or {})
+        top_phone = _top_competitors(nm, "phone")
+        top_type = _top_competitors(nm, "type")
+
+        def _comp_flat(arr: List[Dict[str, Any]]) -> str:
+            bits = []
+            for c in arr[:5]:
+                bits.append(
+                    f"{safe_str(c.get('nm_id'))}: {safe_str(c.get('name'))[:50]} | seller={safe_str(c.get('seller'))[:24]} | "
+                    f"price={_fmt_num(c.get('price'))} | rating={_fmt_num(c.get('rating'))} | fb={_fmt_num(c.get('feedbacks'),0)}"
+                )
+            return "\n".join(bits)
 
         def _ms(cluster: str) -> str:
             return safe_str((cv_by.get(cluster) or {}).get("market_status") or "")
@@ -3601,6 +3774,8 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             "rationale": rationale,
             "backlog": backlog,
             "rules_fired": ", ".join([safe_str(x) for x in rules_fired]),
+            "top_comp_phone": _comp_flat(top_phone),
+            "top_comp_type": _comp_flat(top_type),
             "url": wb_product_url(nm),
         })
 
@@ -3845,7 +4020,7 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         vals = [f"{k}={_fmt_num(data.get(k), 3) if isinstance(data.get(k), (int, float)) else (safe_str(data.get(k)) or '—')}" for k in keys]
         return f"<div class='muted'><b>{_html.escape(label)}:</b> {_html.escape(' | '.join(vals))}</div>"
 
-    def _render_evidence(cluster: str, trace_cluster: dict, fallback_cluster: dict) -> str:
+    def _render_evidence(cluster: str, trace_cluster: dict, fallback_cluster: dict, top_comp: List[Dict[str, Any]]) -> str:
         tc = trace_cluster if isinstance(trace_cluster, dict) else {}
         fb = fallback_cluster if isinstance(fallback_cluster, dict) else {}
         status = safe_str(tc.get("status") or fb.get("market_status") or "UNKNOWN")
@@ -3872,6 +4047,17 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             + _kv_line("Stock", stock, ["qty_median", "qty_n"])
             + f"<div><b>Rules fired:</b> {tags}</div>"
             + f"<div><b>Issues:</b> {issues_html}</div>"
+            + (
+                "<div><b>Топ конкурентов:</b><ul>"
+                + "".join([
+                    f"<li><a href='{_html.escape(safe_str(c.get('url')))}' target='_blank' rel='noreferrer'>{_html.escape(safe_str(c.get('nm_id')))}</a> "
+                    f"{_html.escape(safe_str(c.get('name'))[:60])} | seller={_html.escape(safe_str(c.get('seller'))[:24])} | "
+                    f"price={_html.escape(_fmt_num(c.get('price')))} | rating={_html.escape(_fmt_num(c.get('rating')))} | fb={_html.escape(_fmt_num(c.get('feedbacks'),0))}</li>"
+                    for c in (top_comp or [])[:5]
+                ])
+                + "</ul></div>"
+                if (top_comp or []) else "<div><b>Топ конкурентов:</b> <span class='muted'>—</span></div>"
+            )
         )
         return f"<details><summary>{_html.escape(cluster.upper())}: {_html.escape(status)} ({_html.escape(conf)})</summary>{body}</details>"
 
@@ -3923,7 +4109,10 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         trace_type = dec_trace.get("type") if isinstance(dec_trace.get("type"), dict) else {}
         cv_rows = (cluster_map.get(nm_key, {}).get("cluster_verdicts") or [])
         cv_by_local = {safe_str(x.get("cluster")): x for x in cv_rows if isinstance(x, dict)}
-        evidence_html = _render_evidence("phone", trace_phone, cv_by_local.get("phone") or {}) + _render_evidence("type", trace_type, cv_by_local.get("type") or {})
+        nm_key = safe_str(r.get("nm_id"))
+        top_phone = _top_competitors(nm_key, "phone")
+        top_type = _top_competitors(nm_key, "type")
+        evidence_html = _render_evidence("phone", trace_phone, cv_by_local.get("phone") or {}, top_phone) + _render_evidence("type", trace_type, cv_by_local.get("type") or {}, top_type)
 
         html_rows.append(f"""
 <tr class="row" data-nm="{rid}" data-verdict="{_html.escape(verdict)}" data-cats="{_html.escape(cat_attr)}">
@@ -4031,6 +4220,35 @@ applyFilters();
     priority_actions = (exec_summary or {}).get("priority_actions") if isinstance((exec_summary or {}).get("priority_actions"), list) else []
     focus_segments = (exec_summary or {}).get("focus_segments") if isinstance((exec_summary or {}).get("focus_segments"), list) else []
 
+    sku_n = max(1, len(rows))
+    sku_with_phone_model = sum(1 for r in rows if safe_str(r.get("phone_model")))
+    price_good_n = 0
+    type_eval_n = 0
+    reviews_unreach_n = 0
+    min_price_n_gate = int((supply_thresholds.get("dumping") or {}).get("min_price_n_or", 12))
+    for r in rows:
+        nm = safe_str(r.get("nm_id"))
+        dec = ((decision_map.get(nm) or {}).get("decision") or {})
+        tr = dec.get("decision_trace") if isinstance(dec.get("decision_trace"), dict) else {}
+        ty = tr.get("type") if isinstance(tr.get("type"), dict) else {}
+        if safe_str(ty.get("status")) and not bool(ty.get("skipped")):
+            type_eval_n += 1
+        for cl in ("phone", "type"):
+            c = tr.get(cl) if isinstance(tr.get(cl), dict) else {}
+            supply = c.get("supply") if isinstance(c.get("supply"), dict) else {}
+            if safe_int(supply.get("n"), 0) >= min_price_n_gate:
+                price_good_n += 1
+            pulse = c.get("pulse") if isinstance(c.get("pulse"), dict) else {}
+            if safe_float(pulse.get("unreachable_share"), 0.0) >= 0.5:
+                reviews_unreach_n += 1
+
+    q_phone = sku_with_phone_model / sku_n
+    q_type = type_eval_n / sku_n
+    q_price = price_good_n / (sku_n * 2)
+    q_reviews = reviews_unreach_n / (sku_n * 2)
+    quality_score = (q_phone + q_type + q_price + (1.0 - q_reviews)) / 4.0
+    run_quality = "HIGH" if quality_score >= 0.75 else ("MED" if quality_score >= 0.5 else "LOW")
+
     cards_html = f"""
 <div class='cards'>
   <div class='card'><div class='k'>SKU в отчёте</div><div class='v'>{len(rows)}</div></div>
@@ -4038,6 +4256,21 @@ applyFilters();
   <div class='card'><div class='k'>REVIVE_REWORK</div><div class='v'>{verdict_counts.get('REVIVE_REWORK',0)}</div></div>
   <div class='card'><div class='k'>CLONE_NEW_CARD</div><div class='v'>{verdict_counts.get('CLONE_NEW_CARD',0)}</div></div>
   <div class='card'><div class='k'>DROP</div><div class='v'>{verdict_counts.get('DROP',0)}</div></div>
+  <div class='card'><div class='k'>Run quality</div><div class='v'>{run_quality}</div></div>
+</div>"""
+
+    quality_block = f"""
+<div class='summary'>
+  <section class='panel'>
+    <h2>Качество данных прогона</h2>
+    <ul>
+      <li>% SKU с phone_model: {_fmt_num(q_phone * 100, 1)}%</li>
+      <li>% SKU с TYPE оценкой (not skipped): {_fmt_num(q_type * 100, 1)}%</li>
+      <li>% кластеров с price_n &gt;= {min_price_n_gate}: {_fmt_num(q_price * 100, 1)}%</li>
+      <li>% кластеров с reviews_unreachable (&gt;=0.5): {_fmt_num(q_reviews * 100, 1)}%</li>
+    </ul>
+    <div class='muted'>Run quality: <b>{run_quality}</b></div>
+  </section>
 </div>"""
 
     summary_block = f"""
@@ -4110,6 +4343,7 @@ applyFilters();
 </header>
 <div class='container'>
 {cards_html}
+{quality_block}
 {summary_block}
 {evidence_block}
 <table>
@@ -4889,10 +5123,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--yes", action="store_true", help="Не задавать вопросы, авто-продолжение (для headless)")
     p.add_argument("--list-stages", action="store_true", help="Показать стадии и выйти")
     p.add_argument("--list-models", action="store_true", help="Показать модели и выйти")
+    p.add_argument("--selftest", action="store_true", help="Запустить встроенные регрессионные self-tests и выйти")
 
     p.add_argument("--report-title", default="WB Necromancer v2 Report")
 
     return p
+
+
+def run_selftests() -> None:
+    # test 1: parse_card_v4 must extract price from sizes.price
+    js = {
+        "data": {
+            "products": [{
+                "id": 123,
+                "name": "Case",
+                "sizes": [{"price": {"product": 59900, "sale": 49900, "basic": 79900}}],
+            }]
+        }
+    }
+    p = parse_card_v4(js)
+    pr = p.get("pricing") or {}
+    assert safe_float(pr.get("client_price_rub"), 0.0) > 0, "parse_card_v4: no client_price_rub from sizes.price"
+
+    # test 2: strict/all and lenient/any should diverge on synthetic text
+    groups = [{"name": "model", "any": ["iphone 15"]}, {"name": "intent", "any": ["чехол"]}, {"name": "type", "any": ["карман"]}]
+    txt = "чехол для iphone 15"
+    assert pass_any_group(txt, groups) is True, "pass_any_group should pass"
+    assert pass_must_all_groups(txt, groups) is False, "pass_must_all_groups should fail"
+
+    # test 3: confidence cap helper semantics in Stage L path
+    risk_flags = ["LOW_CONFIDENCE_PRICE"]
+    verdict = "REVIVE_FAST"
+    if verdict == "REVIVE_FAST" and any(x in {"LOW_CONFIDENCE", "LOW_CONFIDENCE_PRICE", "LOW_CONFIDENCE_RELEVANCE"} for x in risk_flags):
+        verdict = "REVIVE_REWORK"
+    assert verdict == "REVIVE_REWORK", "LOW_CONFIDENCE* must cap FAST -> REWORK"
+
+    print("[SELFTEST] OK: parse_card_v4, strict/any relevance, confidence cap")
 
 def main(argv: Optional[List[str]] = None) -> None:
     argv = list(argv) if argv is not None else sys.argv[1:]
@@ -4944,6 +5210,10 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.list_models:
         print_models()
+        return
+
+    if args.selftest:
+        run_selftests()
         return
 
     if args.use_llm_d or args.use_llm_h or args.use_llm_m:

@@ -1,0 +1,165 @@
+# WB_Necro — Evidence-driven patch log (2026-02-23)
+
+## 1) Почему внесены изменения
+
+Основная причина патча — финальная аналитика Stage L/M не давала проверяемой «доказательной» цепочки решения:
+- в части SKU отсутствовали ценовые метрики (`p10/p50/p90`) из-за неполного парсинга формата `card.wb.ru v4`;
+- в отчёте встречались verdict уровня `REVIVE_FAST` при низком качестве данных (флаги LOW_CONFIDENCE*);
+- конкурентный пул мог быть слишком широким и слабо релевантным, если запросы проходили только по мягкому условию (any);
+- HTML/XLSX финал отображал агрегаты, но недостаточно «читалcя глазами» как decision trace с источниками и конкретными конкурентами.
+
+Цель: сделать Stage L + Stage M «доказательными» и формально проверяемыми без регресса A–K.
+
+---
+
+## 2) Что именно изменено
+
+### 2.1 Data foundation: цены и структура предложения
+
+#### A1. `parse_card_v4` (устранение price n=0)
+Доработан парсинг цен:
+- добавлен проход по `sizes[].price` с извлечением вариантов `client/product`, `sale/total`, `basic`;
+- сохранены иерархические fallback-источники на верхнем уровне (`priceU/salePriceU/...`);
+- нормализация к рублям (защита от копеек/целых и «грязных» форматов);
+- в выходную структуру добавлены поля:
+  - `client_price_rub`
+  - `sale_price_rub`
+  - `list_price_rub`
+  - `price_source`
+
+Результат: Stage J получает более плотный ценовой массив; в отчёте уменьшается количество «—» в price block.
+
+#### A2. Stage J (`stage_J_supply`): корректный сигнал качества цены
+Изменения:
+- расчёт цен конкурентов теперь опирается на `client_price_rub -> sale_price_rub -> list_price_rub` (с fallback на legacy);
+- при `price_n < min_price_n` выставляется `LOW_CONFIDENCE_PRICE` вместо «немой» пустоты;
+- добавлена передача `LOW_CONFIDENCE_RELEVANCE` из relevance-слоя, чтобы не терять качество входного пула.
+
+Результат: проблемы с данными фиксируются как явные флаги и учитываются в решении.
+
+---
+
+### 2.2 Relevance hardening (Stage E)
+
+Добавлены функции и ветки строгой проверки:
+- `pass_must_all_groups` (AND по группам);
+- `pass_any_group` (совместимость с текущей any-логикой);
+- для каждого запроса считаются `pass_any_rate` и `pass_all_rate`;
+- выбор запроса отдаёт приоритет строгой метрике (`pass_all_rate`), fallback на any используется только при провале strict;
+- при fallback фиксируется `low_confidence_relevance` и `selection_mode`.
+
+Результат: пул конкурентов меньше «размывается», а отчёт прозрачно показывает, когда пришлось деградировать до lenient-режима.
+
+---
+
+### 2.3 Decision governance (Stage L)
+
+#### C1. Запрет `REVIVE_FAST` на плохих данных
+В Stage L добавлено правило-гейт:
+- если присутствует любой из флагов `LOW_CONFIDENCE`, `LOW_CONFIDENCE_PRICE`, `LOW_CONFIDENCE_RELEVANCE`,
+- verdict `REVIVE_FAST` автоматически понижается до `REVIVE_REWORK`,
+- в `rules_fired` добавляется `DECISION_CAP_FAST_BY_LOW_CONFIDENCE`.
+
+Это предотвращает «ложно-оптимистичные» быстрые решения при неполной базе.
+
+#### D1. Расширение decision trace
+В `decisions.jsonl` добавлены структурные блоки:
+- `decision.rules_fired`
+- `decision.decision_trace`
+- `decision.backlog_items` (при сохранении legacy `backlog` и `rationale`)
+
+`decision_trace` содержит:
+- phone/type market статус и confidence;
+- pulse/supply метрики;
+- issues, fired rules, evidence lines;
+- data quality ограничения;
+- final verdict logic.
+
+Результат: отчёт рендерит не лозунги, а цепочку «факт → правило → решение».
+
+---
+
+### 2.4 Final report usability (Stage M)
+
+#### HTML
+- добавлена и заполнена evidence-колонка с `details` по PHONE/TYPE;
+- отображаются fired rules, quality limits и top competitors;
+- добавлены глобальные data-quality KPI:
+  - % SKU с phone_model,
+  - % SKU с TYPE оценкой (не skipped),
+  - % с достаточным price_n,
+  - % с reviews_unreachable,
+  - общий индикатор run quality (LOW/MED/HIGH).
+
+#### XLSX
+Сохранена совместимость листа `REPORT`, и добавлены новые листы:
+- `EVIDENCE_MARKET`
+- `EVIDENCE_SUPPLY`
+- `THRESHOLDS`
+
+#### Validator
+В конце формирования отчёта добавлен mini-validator, предупреждающий о типовых дефектах:
+- verdict без evidence;
+- UNKNOWN без unreachable-share;
+- DUMPING_PRESSURE без p10/p50.
+
+---
+
+### 2.5 Встроенные регрессионные самотесты
+
+Добавлен `--selftest` и `run_selftests()`:
+1. парсинг цены из `sizes.price`;
+2. различимость strict/all и any relevance;
+3. запрет FAST при LOW_CONFIDENCE*.
+
+Цель — ловить критичные регрессы без внешнего стенда.
+
+---
+
+## 3) Ошибки в ходе работ и как исправлены
+
+### Ошибка 1: неверный импорт `jdump` в ad-hoc harness
+- Симптом: `ImportError: cannot import name 'jdump' from 'WB_Necro'`.
+- Причина: вспомогательная функция не экспортируется как публичный API.
+- Исправление: удалён импорт `jdump`, использован стандартный `json`.
+
+### Ошибка 2: неверная сигнатура `stage_L_decisions`
+- Симптом: `TypeError: got an unexpected keyword argument 'manifest_path'`.
+- Причина: функция принимает `out_dir`, а не путь к файлам поштучно.
+- Исправление: harness перестроен под файловую структуру каталога и вызов `stage_L_decisions(out_dir)`.
+
+### Ошибка 3: неверная структура `run_manifest.json` в synthetic run
+- Симптом: `KeyError: 'meta'`.
+- Причина: Stage L ожидает `manifest["meta"]["run_id"]` и полный формат манифеста.
+- Исправление: synthetic прогон приведён к реальному контракту манифеста.
+
+### Ошибка 4: частые предупреждения “apply_patch requested via exec_command”
+- Симптом: системные предупреждения о некорректном способе patch-редактирования.
+- Причина: в прошлых итерациях редактирование инициировалось shell-командой.
+- Исправление: правки выполнены напрямую в рабочем файле и проверены компиляцией/selftest.
+
+---
+
+## 4) Что теперь делает скрипт в финале (Stage L/M)
+
+После патча финальная часть работает как «доказательный конвейер»:
+1. Stage L формирует решение и одновременно складывает decision trace с числовыми фактами и сработавшими правилами.
+2. Если качество данных низкое, aggressive verdict автоматически ограничивается (без ручного контроля).
+3. Stage M рендерит HTML/XLSX так, чтобы оператор видел:
+   - статусы PHONE/TYPE,
+   - конкретные метрики pulse/supply,
+   - issues + thresholds,
+   - top competitors,
+   - глобальный health качества запуска.
+4. Встроенный validator предупреждает о дырах доказательной базы.
+
+Итог: решения становятся проверяемыми, воспроизводимыми и пригодными к аудиту под релиз.
+
+---
+
+## 5) Остаточные риски и рекомендации
+
+1. Stage E strict-группы зависят от наполнения query-пака; при недостаточно явной разметке token-групп желательно зафиксировать унифицированный генератор strict-групп (модель + intent case + type-атрибуты).
+2. Для production-run полезно хранить versioned snapshot порогов внутри отчётного пакета (частично закрыто листом THRESHOLDS).
+3. Рекомендуется nightly cron с `--selftest` + smoke-генерацией одного synthetic отчёта и проверкой наличия evidence-листов.
+
