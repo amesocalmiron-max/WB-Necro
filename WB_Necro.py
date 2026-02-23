@@ -189,7 +189,7 @@ STAGE_IO = {
     "D": {"in": "intent.jsonl", "out": "queries_raw.jsonl"},
     "E": {"in": "queries_raw.jsonl", "out": "queries_valid.jsonl (+ .wb_cache/serp/*.json)"},
     "F": {"in": "queries_valid.jsonl", "out": "competitor_pool.jsonl"},
-    "G": {"in": "competitor_pool.jsonl", "out": "competitor_lite.jsonl (+ .wb_cache/cards/*.json)"},
+    "G": {"in": "competitor_pool.jsonl", "out": "competitor_lite.jsonl (+ .wb_cache/comp_lite/*.json)"},
     "H": {"in": "competitor_lite.jsonl + intent.jsonl", "out": "relevance.jsonl"},
     "I": {"in": "relevance.jsonl + competitor_lite.jsonl", "out": "market_pulse.jsonl (+ .wb_cache/reviews/*.json)"},
     "J": {"in": "market_pulse.jsonl + relevance.jsonl", "out": "supply_structure.jsonl"},
@@ -584,7 +584,7 @@ STAGE_ARTIFACTS = {
 STAGE_CACHES = {
     "B": [".wb_cache"],
     "E": [".wb_cache/serp"],
-    "G": [".wb_cache/cards"],
+    "G": [".wb_cache/comp_lite"],
     "I": [".wb_cache/reviews"],
 }
 
@@ -2110,7 +2110,8 @@ def stage_F_pool(out_dir: Path, *, resume: bool, competitors_k: int, per_query_t
 # Stage G: competitor lite fetch
 # =========================
 
-def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool) -> Path:
+def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
+                 refetch_failed: bool = True, cache_ttl_hours: int = 36) -> Path:
     manifest = load_manifest(out_dir)
     run_id = manifest["meta"]["run_id"]
     wb_cfg = (manifest.get("config") or {}).get("wb") or {}
@@ -2126,6 +2127,36 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool) -
     sess = req_session()
     cache_dir = out_dir / ".wb_cache" / "comp_lite"
     ensure_dir(cache_dir)
+
+    def _cache_age_hours(path: Path) -> float:
+        try:
+            dt = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0)
+        except Exception:
+            return 10**9
+
+    def _is_payload_ok(card: Any) -> bool:
+        if not isinstance(card, dict):
+            return False
+        v4 = (card.get("v4") or {}) if isinstance(card.get("v4"), dict) else {}
+        ids = (v4.get("ids") or {}) if isinstance(v4.get("ids"), dict) else {}
+        content = (v4.get("content") or {}) if isinstance(v4.get("content"), dict) else {}
+        return bool(ids.get("nm_id") or content.get("title"))
+
+    def _should_refetch(card: Any, cpath: Path) -> Tuple[bool, str]:
+        if card is None:
+            return True, "cache_miss"
+        st = safe_str(card.get("status"))
+        http = safe_int(card.get("http"), 0)
+        if st != "ok" or http != 200:
+            return (bool(refetch_failed), f"cached_fail status={st} http={http}")
+        if not _is_payload_ok(card):
+            return True, "invalid_payload"
+        age_h = _cache_age_hours(cpath)
+        ttl_h = max(0, safe_int(cache_ttl_hours, 36) if safe_int(cache_ttl_hours, 36) is not None else 36)
+        if age_h > float(ttl_h):
+            return True, f"ttl_expired age_h={age_h:.1f}>{ttl_h}"
+        return False, "cache_ok"
 
     for rec in iter_jsonl(pool_path):
         meta = rec.get("meta") or {}
@@ -2143,6 +2174,7 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool) -
             lite_items: List[dict] = []
             ok_n = 0
             fail_n = 0
+            refetch_n = 0
             for c in picked:
                 cnm = nm_id_to_str(c.get("nm_id"))
                 if not cnm:
@@ -2156,22 +2188,41 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool) -
                         fetch = {"cache": True, "path": str(cpath)}
                     except Exception:
                         card = None
-                if card is None:
+
+                must_fetch, reason = _should_refetch(card, cpath)
+                if must_fetch:
                     status, http_code, js, api_url, dest_used = fetch_card_any(sess, cnm, dests=dests, timeout=timeout)
                     parsed = parse_card_v4(js) if js else {}
-                    card = {"status": status, "http": http_code, "api_url": api_url, "dest": dest_used, "v4": parsed}
+                    card = {
+                        "status": status,
+                        "http": http_code,
+                        "api_url": api_url,
+                        "dest": dest_used,
+                        "fetched_at": utc_now_iso(),
+                        "v4": parsed,
+                    }
                     write_json(cpath, card)
-                    fetch = {"cache": False, "status": status, "http": http_code}
+                    fetch = {
+                        "cache": False,
+                        "status": status,
+                        "http": http_code,
+                        "refetch_reason": reason,
+                    }
+                    refetch_n += 1
                     time.sleep(max(0.0, float(sleep_s)))
+                else:
+                    if isinstance(fetch, dict):
+                        fetch["cache_reason"] = reason
+
                 try:
-                    if safe_str(card.get("status")) == "ok" and int(card.get("http") or 0) == 200:
+                    if safe_str(card.get("status")) == "ok" and int(card.get("http") or 0) == 200 and _is_payload_ok(card):
                         ok_n += 1
                     else:
                         fail_n += 1
                 except Exception:
                     fail_n += 1
                 lite_items.append({"nm_id": cnm, "seed": c, "card": card, "fetch": fetch})
-            out_clusters.append({"cluster": cluster, "items": lite_items, "stats": {"ok_n": int(ok_n), "fail_n": int(fail_n)}})
+            out_clusters.append({"cluster": cluster, "items": lite_items, "stats": {"ok_n": int(ok_n), "fail_n": int(fail_n), "refetch_n": int(refetch_n)}})
 
         out_rec = {"meta": make_meta(run_id, "G", nm, vendor_code, name), "clusters": out_clusters}
         append_jsonl(out_path, out_rec)
@@ -2179,7 +2230,13 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool) -
             cstats = {x.get("cluster"): x.get("stats") for x in (out_rec.get("clusters") or []) if isinstance(x, dict)}
             ph = cstats.get("phone") or {}
             ty = cstats.get("type") or {}
-            stage_sku("G", nm, f"lite phone_ok={ph.get('ok_n')} fail={ph.get('fail_n')} | type_ok={ty.get('ok_n')} fail={ty.get('fail_n')}", level=1)
+            stage_sku(
+                "G",
+                nm,
+                f"lite phone_ok={ph.get('ok_n')} fail={ph.get('fail_n')} refetch={ph.get('refetch_n')} | "
+                f"type_ok={ty.get('ok_n')} fail={ty.get('fail_n')} refetch={ty.get('refetch_n')}",
+                level=1,
+            )
         except Exception:
             pass
 
@@ -3567,8 +3624,9 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
                     verdict = "REVIVE_REWORK"
                     decision_rules_fired.append("DECISION_FORCE_REWORK_LOW_CONFIDENCE")
 
-        low_conf_set = {"LOW_CONFIDENCE", "LOW_CONFIDENCE_PRICE", "LOW_CONFIDENCE_RELEVANCE"}
-        if verdict == "REVIVE_FAST" and any(x in low_conf_set for x in set(risk_flags)):
+        low_conf_set = {"LOW_CONFIDENCE", "LOW_CONFIDENCE_PRICE", "LOW_CONFIDENCE_RELEVANCE", "REVIEWS_UNREACHABLE"}
+        has_unknown = any("UNKNOWN" in safe_str(x) for x in set(risk_flags))
+        if verdict == "REVIVE_FAST" and (any(x in low_conf_set for x in set(risk_flags)) or has_unknown):
             verdict = "REVIVE_REWORK"
             decision_rules_fired.append("DECISION_CAP_FAST_BY_LOW_CONFIDENCE")
             rationale.append("Вердикт понижен до REVIVE_REWORK из-за качества данных (LOW_CONFIDENCE*).")
@@ -4440,7 +4498,14 @@ def run_stage(code: str, out_dir: Path, args: argparse.Namespace) -> None:
     elif code == "F":
         stage_F_pool(out_dir, resume=args.resume, competitors_k=args.competitors_k, per_query_take=args.per_query_take)
     elif code == "G":
-        stage_G_lite(out_dir, timeout=args.wb_timeout, sleep_s=args.sleep, resume=args.resume)
+        stage_G_lite(
+            out_dir,
+            timeout=args.wb_timeout,
+            sleep_s=args.sleep,
+            resume=args.resume,
+            refetch_failed=(not args.no_refetch_failed_lite),
+            cache_ttl_hours=args.lite_cache_ttl_hours,
+        )
     elif code == "H":
         stage_H_relevance(
             out_dir,
@@ -4508,16 +4573,16 @@ def run_pipeline(args: argparse.Namespace) -> None:
             if getattr(args, "yes", False) or (not sys.stdin.isatty()):
                 # headless: просто логируем, что пауза пропущена
                 if need_pause_before_llm:
-                    stage_line("", "[pause-before-llm] Пропускаю паузу (yes/headless).", level=1)
+                    stage_line("", "[pause-before-llm] Пропускаю паузу (yes/headless). VPN hint: для LLM обычно ON.", level=1)
                     setattr(args, "_did_pause_before_llm", True)
                 else:
-                    stage_line("", "[pause] Пропускаю паузу (yes/headless).", level=1)
+                    stage_line("", f"[pause] Пропускаю паузу (yes/headless). Следующая стадия {code}: {_stage_vpn_hint(code, args)}", level=1)
             else:
                 if need_pause_before_llm:
-                    input("Пауза перед LLM. Включи VPN (если надо) и жми Enter... ")
+                    input(f"Пауза перед LLM стадией {code}. {_stage_vpn_hint(code, args)} Нажми Enter... ")
                     setattr(args, "_did_pause_before_llm", True)
                 else:
-                    input("Пауза. Нажми Enter, когда готов продолжать (например, включил VPN для LLM). ")
+                    input(f"Пауза перед стадией {code}. {_stage_vpn_hint(code, args)} Нажми Enter, когда готов продолжать... ")
 
 
         t0 = time.time()
@@ -5083,6 +5148,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--wb-timeout", type=int, default=30)
     p.add_argument("--sleep", type=float, default=0.35, help="Sleep между WB запросами (сек)")
     p.add_argument("--no-deep-card", action="store_true", help="Не тянуть wbbasket deep card.json")
+    p.add_argument("--no-refetch-failed-lite", action="store_true", help="Stage G: не перезапрашивать fail-кэш competitor lite")
+    p.add_argument("--lite-cache-ttl-hours", type=int, default=36, help="Stage G: TTL ok-кэша competitor lite (часы)")
 
     p.add_argument("--lexicon", default="", help="Путь к lexicon.json (опционально)")
 
@@ -5154,11 +5221,54 @@ def run_selftests() -> None:
     # test 3: confidence cap helper semantics in Stage L path
     risk_flags = ["LOW_CONFIDENCE_PRICE"]
     verdict = "REVIVE_FAST"
-    if verdict == "REVIVE_FAST" and any(x in {"LOW_CONFIDENCE", "LOW_CONFIDENCE_PRICE", "LOW_CONFIDENCE_RELEVANCE"} for x in risk_flags):
+    if verdict == "REVIVE_FAST" and (
+        any(x in {"LOW_CONFIDENCE", "LOW_CONFIDENCE_PRICE", "LOW_CONFIDENCE_RELEVANCE", "REVIEWS_UNREACHABLE"} for x in risk_flags)
+        or any("UNKNOWN" in safe_str(x) for x in risk_flags)
+    ):
         verdict = "REVIVE_REWORK"
     assert verdict == "REVIVE_REWORK", "LOW_CONFIDENCE* must cap FAST -> REWORK"
 
-    print("[SELFTEST] OK: parse_card_v4, strict/any relevance, confidence cap")
+    # test 4: Stage G must refetch failed cache by default
+    import tempfile
+    td = Path(tempfile.mkdtemp(prefix='wb_selftest_g_'))
+    ensure_dir(td)
+    ensure_dir(td / '.wb_cache' / 'comp_lite')
+    write_json(td / 'run_manifest.json', {
+        'meta': {'run_id': 'selftest'},
+        'config': {'wb': {'dests': [123]}}
+    })
+    append_jsonl(td / 'competitor_pool.jsonl', {
+        'meta': make_meta('selftest', 'F', '1', 'vc', 'name'),
+        'pool': {'by_cluster': {'phone': [{'nm_id': '777'}], 'type': []}}
+    })
+    write_json(td / '.wb_cache' / 'comp_lite' / '777.json', {'status': 'err', 'http': 503, 'v4': {}})
+
+    orig_fetch = globals().get('fetch_card_any')
+    calls = {'n': 0}
+    def _fake_fetch(sess, cnm, *, dests, timeout):
+        calls['n'] += 1
+        return 'ok', 200, {'data': {'products': [{'id': int(cnm), 'name': 'ok card', 'sizes': [{'price': {'product': 99900}}]}]}}, 'fake://card', int(dests[0]) if dests else 0
+    globals()['fetch_card_any'] = _fake_fetch
+    try:
+        stage_G_lite(td, timeout=1, sleep_s=0.0, resume=False, refetch_failed=True, cache_ttl_hours=48)
+    finally:
+        globals()['fetch_card_any'] = orig_fetch
+    assert calls['n'] >= 1, 'Stage G should refetch failed cache'
+
+    # test 5: Stage G should refetch stale ok-cache by TTL
+    calls2 = {'n': 0}
+    def _fake_fetch2(sess, cnm, *, dests, timeout):
+        calls2['n'] += 1
+        return 'ok', 200, {'data': {'products': [{'id': int(cnm), 'name': 'ok card 2', 'sizes': [{'price': {'product': 109900}}]}]}}, 'fake://card2', int(dests[0]) if dests else 0
+    globals()['fetch_card_any'] = _fake_fetch2
+    try:
+        stage_G_lite(td, timeout=1, sleep_s=0.0, resume=False, refetch_failed=True, cache_ttl_hours=0)
+    finally:
+        globals()['fetch_card_any'] = orig_fetch
+    assert calls2['n'] >= 1, 'Stage G should refetch stale cache by TTL'
+
+    print("[SELFTEST] OK: parse_card_v4, strict/any relevance, confidence cap, Stage G refetch+TTL")
+
 
 def main(argv: Optional[List[str]] = None) -> None:
     argv = list(argv) if argv is not None else sys.argv[1:]
