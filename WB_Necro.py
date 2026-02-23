@@ -1814,7 +1814,7 @@ def stage_D_queries(out_dir: Path, *, resume: bool, rules_per_cluster: int, llm_
 
 def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: int, resume: bool,
                  min_keep_per_cluster: int, max_keep_per_cluster: int,
-                 min_pass_rate_phone: float, min_pass_rate_type: float) -> Path:
+                 min_pass_rate_phone: float, min_pass_rate_type: float, trust_env: bool = True) -> Path:
     manifest = load_manifest(out_dir)
     run_id = manifest["meta"]["run_id"]
     wb_cfg = (manifest.get("config") or {}).get("wb") or {}
@@ -2896,7 +2896,7 @@ def _median_int(vals: List[int]) -> Optional[float]:
         return float(vs[mid])
     return (vs[mid - 1] + vs[mid]) / 2.0
 
-def stage_I_pulse(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool, strict: bool = False) -> Path:
+def stage_I_pulse(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool, strict: bool = False, trust_env: bool = True) -> Path:
     manifest = load_manifest(out_dir)
     run_id = manifest["meta"]["run_id"]
     cfg = manifest.get("config") or {}
@@ -5293,6 +5293,13 @@ def run_selftests() -> None:
     txt = "чехол для iphone 15"
     assert pass_any_group(txt, groups) is True, "pass_any_group should pass"
     assert pass_must_all_groups(txt, groups) is False, "pass_must_all_groups should fail"
+
+    # test 2.5: signatures for trust_env must exist (guard against runner mismatch)
+    import inspect
+    sig_e = inspect.signature(stage_E_serp)
+    sig_i = inspect.signature(stage_I_pulse)
+    assert "trust_env" in sig_e.parameters, "stage_E_serp must accept trust_env"
+    assert "trust_env" in sig_i.parameters, "stage_I_pulse must accept trust_env"
 
     # test 3: confidence cap helper semantics in Stage L path
     risk_flags = ["LOW_CONFIDENCE_PRICE"]

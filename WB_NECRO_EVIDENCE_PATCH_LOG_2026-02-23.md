@@ -238,3 +238,33 @@
 - `python WB_Necro.py --help | rg "refetch-lite-all|no-trust-env|lite-cache-ttl-hours|no-refetch-failed-lite"`
 
 Все проверки успешно пройдены в текущей итерации.
+
+---
+
+## 8) Hotfix: совместимость run_stage ↔ stage_E/stage_I по trust_env
+
+### Инцидент
+- Pipeline падал на стадии E с ошибкой:
+  - `TypeError: stage_E_serp() got an unexpected keyword argument 'trust_env'`
+- Причина: `run_stage(...)` уже передавал `trust_env`, но сигнатура `stage_E_serp` не принимала этот аргумент.
+- Аналогичный риск был у `stage_I_pulse` (runner передаёт `trust_env`, сигнатура не принимала).
+
+### Исправление
+- Добавлен kw-only аргумент `trust_env: bool = True` в:
+  - `stage_E_serp(...)`
+  - `stage_I_pulse(...)`
+- Внутри обеих стадий продолжено использование `req_session(trust_env=trust_env)`.
+- Обратная совместимость сохранена: все существующие аргументы остаются, добавлен только новый optional kw-arg.
+
+### Антирегресс
+- В `--selftest` добавлена проверка через `inspect.signature(...)`, что:
+  - `stage_E_serp` содержит параметр `trust_env`;
+  - `stage_I_pulse` содержит параметр `trust_env`.
+
+### Проверка
+- `python -m py_compile WB_Necro.py`
+- `python WB_Necro.py --selftest`
+- `python WB_Necro.py --help | rg "no-trust-env|refetch-lite-all|no-refetch-failed-lite"`
+- `python WB_Necro.py --list-stages`
+
+Все команды завершились успешно.
