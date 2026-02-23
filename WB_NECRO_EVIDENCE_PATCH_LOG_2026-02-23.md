@@ -196,3 +196,45 @@
   - fail-кэш обязан рефетчиться по умолчанию;
   - устаревший ok-кэш (TTL=0) обязан рефетчиться;
   - cap FAST->REWORK сохраняется.
+
+---
+
+## 7) Дополнительные доработки по комментариям ревью (A/B/C/D)
+
+### A) Диагностика фейлов Stage G без гадания
+
+Добавлена агрегированная сводка на уровне стадии:
+- HTTP bins: `200 / 429 / 403 / 5xx / timeout / other`;
+- Top fail reasons (топ-3 причин по счётчику).
+
+Теперь после Stage G в логе сразу видно природу проблем, а не только `ok_n/fail_n`.
+
+### B) Force refresh для lite
+
+Добавлен флаг:
+- `--refetch-lite-all`
+
+Эффект: Stage G игнорирует кэш и принудительно обновляет все lite-карточки (цены/остатки/метрики), без удаления папок вручную.
+
+### C) Управление `requests.Session(trust_env)`
+
+Добавлен флаг:
+- `--no-trust-env`
+
+Эффект: для WB-стадий (B/E/G/I) `Session.trust_env=False`, чтобы случайные системные proxy/env-настройки не ломали сетевое поведение.
+
+### D) Красивый рендер `backlog_items` в HTML
+
+В Stage M обновлён блок “Что делать”:
+- если есть `decision.backlog_items`, то рендер идёт структурно;
+- группировка по `tag` (`price/seo/content/data/social/other`);
+- сортировка внутри групп по `prio` (возрастание), затем по `task`;
+- fallback на старый плоский `backlog` сохранён.
+
+### Проверка
+
+- `python -m py_compile WB_Necro.py`
+- `python WB_Necro.py --selftest`
+- `python WB_Necro.py --help | rg "refetch-lite-all|no-trust-env|lite-cache-ttl-hours|no-refetch-failed-lite"`
+
+Все проверки успешно пройдены в текущей итерации.

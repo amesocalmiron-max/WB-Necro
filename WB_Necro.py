@@ -740,10 +740,10 @@ def load_lexicon(path: Optional[str]) -> Lexicon:
 # WB HTTP клиент и эндпоинты
 # =========================
 
-def req_session() -> requests.Session:
+def req_session(*, trust_env: bool = True) -> requests.Session:
     s = requests.Session()
     s.headers.update(HEADERS)
-    s.trust_env = True  # если у тебя прокси в окружении, это оно
+    s.trust_env = bool(trust_env)
     return s
 
 def backoff_sleep(attempt: int, base: float = 0.4, cap: float = 6.0) -> None:
@@ -1480,7 +1480,7 @@ def fetch_card_any(sess: requests.Session, nm_id: str, *, dests: List[int], time
             return "ok_v1", code, js, url, dest
     return "not_found", 404, None, "", 0
 
-def stage_B_own_fetch(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool, deep_card: bool) -> Path:
+def stage_B_own_fetch(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool, deep_card: bool, trust_env: bool = True) -> Path:
     manifest = load_manifest(out_dir)
     run_id = manifest["meta"]["run_id"]
     scope = scope_from_manifest(manifest)
@@ -1492,7 +1492,7 @@ def stage_B_own_fetch(out_dir: Path, *, timeout: int, sleep_s: float, resume: bo
     err_path = out_dir / "own_errors.jsonl"
     done = read_jsonl_done_ids(out_path) if resume else set()
 
-    sess = req_session()
+    sess = req_session(trust_env=trust_env)
     cache_dir = out_dir / ".wb_cache" / "own"
     ensure_dir(cache_dir)
 
@@ -1827,7 +1827,7 @@ def stage_E_serp(out_dir: Path, *, timeout: int, sleep_s: float, search_limit: i
     out_path = out_dir / "queries_valid.jsonl"
     done = read_jsonl_done_ids(out_path) if resume else set()
 
-    sess = req_session()
+    sess = req_session(trust_env=trust_env)
     cache_dir = out_dir / ".wb_cache" / "serp"
     ensure_dir(cache_dir)
 
@@ -2111,7 +2111,8 @@ def stage_F_pool(out_dir: Path, *, resume: bool, competitors_k: int, per_query_t
 # =========================
 
 def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
-                 refetch_failed: bool = True, cache_ttl_hours: int = 36) -> Path:
+                 refetch_failed: bool = True, cache_ttl_hours: int = 36, refetch_all: bool = False,
+                 trust_env: bool = True) -> Path:
     manifest = load_manifest(out_dir)
     run_id = manifest["meta"]["run_id"]
     wb_cfg = (manifest.get("config") or {}).get("wb") or {}
@@ -2124,9 +2125,31 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
     out_path = out_dir / "competitor_lite.jsonl"
     done = read_jsonl_done_ids(out_path) if resume else set()
 
-    sess = req_session()
+    sess = req_session(trust_env=trust_env)
     cache_dir = out_dir / ".wb_cache" / "comp_lite"
     ensure_dir(cache_dir)
+
+    http_bins = {"200": 0, "403": 0, "429": 0, "5xx": 0, "timeout": 0, "other": 0}
+    fail_reasons_counter: Dict[str, int] = {}
+
+    def _bump_fail(reason: str) -> None:
+        r = safe_str(reason) or "unknown"
+        fail_reasons_counter[r] = fail_reasons_counter.get(r, 0) + 1
+
+    def _classify_http(card: Dict[str, Any]) -> str:
+        code = safe_int(card.get("http"), 0)
+        st = safe_str(card.get("status")).lower()
+        if code == 200:
+            return "200"
+        if code == 403:
+            return "403"
+        if code == 429:
+            return "429"
+        if 500 <= code <= 599:
+            return "5xx"
+        if code in (0, None) or "timeout" in st:
+            return "timeout"
+        return "other"
 
     def _cache_age_hours(path: Path) -> float:
         try:
@@ -2144,6 +2167,8 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
         return bool(ids.get("nm_id") or content.get("title"))
 
     def _should_refetch(card: Any, cpath: Path) -> Tuple[bool, str]:
+        if refetch_all:
+            return True, "force_refetch_all"
         if card is None:
             return True, "cache_miss"
         st = safe_str(card.get("status"))
@@ -2215,12 +2240,18 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
                         fetch["cache_reason"] = reason
 
                 try:
+                    cls = _classify_http(card if isinstance(card, dict) else {})
+                    http_bins[cls] = http_bins.get(cls, 0) + 1
                     if safe_str(card.get("status")) == "ok" and int(card.get("http") or 0) == 200 and _is_payload_ok(card):
                         ok_n += 1
                     else:
                         fail_n += 1
+                        reason = safe_str((fetch or {}).get("refetch_reason") or (fetch or {}).get("cache_reason") or (card or {}).get("status") or f"http_{safe_int((card or {}).get('http'),0)}")
+                        _bump_fail(reason)
                 except Exception:
                     fail_n += 1
+                    http_bins["other"] = http_bins.get("other", 0) + 1
+                    _bump_fail("exception")
                 lite_items.append({"nm_id": cnm, "seed": c, "card": card, "fetch": fetch})
             out_clusters.append({"cluster": cluster, "items": lite_items, "stats": {"ok_n": int(ok_n), "fail_n": int(fail_n), "refetch_n": int(refetch_n)}})
 
@@ -2239,6 +2270,15 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
             )
         except Exception:
             pass
+
+    top_fail = sorted(fail_reasons_counter.items(), key=lambda kv: kv[1], reverse=True)[:3]
+    stage_line(
+        "G",
+        f"HTTP bins: 200={http_bins.get('200',0)} 429={http_bins.get('429',0)} 403={http_bins.get('403',0)} 5xx={http_bins.get('5xx',0)} timeout={http_bins.get('timeout',0)} other={http_bins.get('other',0)}",
+        level=1,
+    )
+    if top_fail:
+        stage_line("G", f"Top fail reasons: {', '.join([f'{k}:{v}' for k,v in top_fail])}", level=1)
 
     stage_dbg("G", f"wrote {out_path}")
     return out_path
@@ -2888,7 +2928,7 @@ def stage_I_pulse(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool, 
 
     cache_dir = out_dir / ".wb_cache" / "reviews"
     ensure_dir(cache_dir)
-    sess = req_session()
+    sess = req_session(trust_env=trust_env)
 
     def cache_path_for(imt_id: int) -> Path:
         return cache_dir / f"imt_{int(imt_id)}.json"
@@ -4074,6 +4114,34 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             )
         return "".join(items) if items else "<div class='muted'>Нет данных</div>"
 
+    def _render_backlog_items(items: List[Dict[str, Any]], fallback_text: str) -> str:
+        arr = [x for x in (items or []) if isinstance(x, dict)]
+        if not arr:
+            return f"<pre>{_html.escape(fallback_text)}</pre>" if safe_str(fallback_text).strip() else "<span class='muted'>—</span>"
+        groups: Dict[str, List[Dict[str, Any]]] = {}
+        for it in arr:
+            tag = safe_str(it.get("tag") or "other")
+            groups.setdefault(tag, []).append(it)
+        order = ["price", "seo", "content", "data", "social", "other"]
+        html_parts = []
+        for tag in order:
+            lst = groups.get(tag) or []
+            if not lst:
+                continue
+            lst = sorted(lst, key=lambda x: (safe_int(x.get("prio"), 99), safe_str(x.get("task"))))
+            lis = []
+            for it in lst:
+                pr = safe_int(it.get("prio"), None)
+                task = safe_str(it.get("task")) or "—"
+                reason = safe_str(it.get("reason"))
+                badge = f"[P{pr}] " if pr is not None else ""
+                line = f"{badge}{task}"
+                if reason:
+                    line += f" — {reason}"
+                lis.append(f"<li>{_html.escape(line)}</li>")
+            html_parts.append(f"<div><span class='tag c-{_flag_category(tag)}'>{_html.escape(tag)}</span><ul>{''.join(lis)}</ul></div>")
+        return ''.join(html_parts) if html_parts else (f"<pre>{_html.escape(fallback_text)}</pre>" if safe_str(fallback_text).strip() else "<span class='muted'>—</span>")
+
     def _kv_line(label: str, data: Dict[str, Any], keys: List[str]) -> str:
         vals = [f"{k}={_fmt_num(data.get(k), 3) if isinstance(data.get(k), (int, float)) else (safe_str(data.get(k)) or '—')}" for k in keys]
         return f"<div class='muted'><b>{_html.escape(label)}:</b> {_html.escape(' | '.join(vals))}</div>"
@@ -4160,7 +4228,10 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         rationale_text = "\n".join(rationale_lines)
 
         nm_key = safe_str(r.get("nm_id"))
-        dec_trace = (((decision_map.get(nm_key) or {}).get("decision") or {}).get("decision_trace") or {})
+        dec_full = ((decision_map.get(nm_key) or {}).get("decision") or {})
+        backlog_items_struct = dec_full.get("backlog_items") if isinstance(dec_full.get("backlog_items"), list) else []
+        backlog_html = _render_backlog_items(backlog_items_struct, backlog_text)
+        dec_trace = (dec_full.get("decision_trace") or {})
         if not isinstance(dec_trace, dict):
             dec_trace = {}
         trace_phone = dec_trace.get("phone") if isinstance(dec_trace.get("phone"), dict) else {}
@@ -4190,7 +4261,7 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
   <td>{evidence_html}</td>
   <td>{flags_html}</td>
   <td><details><summary>Почему так</summary><pre>{_html.escape(rationale_text)}</pre></details></td>
-  <td><details><summary>Что делать</summary><pre>{_html.escape(backlog_text)}</pre></details></td>
+  <td><details><summary>Что делать</summary>{backlog_html}</details></td>
 </tr>
 """)
 
@@ -4464,7 +4535,7 @@ def run_stage(code: str, out_dir: Path, args: argparse.Namespace) -> None:
             lexicon_path=args.lexicon,
         )
     elif code == "B":
-        stage_B_own_fetch(out_dir, timeout=args.wb_timeout, sleep_s=args.sleep, resume=args.resume, deep_card=(not args.no_deep_card))
+        stage_B_own_fetch(out_dir, timeout=args.wb_timeout, sleep_s=args.sleep, resume=args.resume, deep_card=(not args.no_deep_card), trust_env=(not args.no_trust_env))
     elif code == "C":
         stage_C_intent(out_dir, resume=args.resume)
     elif code == "D":
@@ -4494,6 +4565,7 @@ def run_stage(code: str, out_dir: Path, args: argparse.Namespace) -> None:
             max_keep_per_cluster=args.max_keep_per_cluster,
             min_pass_rate_phone=args.min_pass_rate_phone,
             min_pass_rate_type=args.min_pass_rate_type,
+            trust_env=(not args.no_trust_env),
         )
     elif code == "F":
         stage_F_pool(out_dir, resume=args.resume, competitors_k=args.competitors_k, per_query_take=args.per_query_take)
@@ -4505,6 +4577,8 @@ def run_stage(code: str, out_dir: Path, args: argparse.Namespace) -> None:
             resume=args.resume,
             refetch_failed=(not args.no_refetch_failed_lite),
             cache_ttl_hours=args.lite_cache_ttl_hours,
+            refetch_all=args.refetch_lite_all,
+            trust_env=(not args.no_trust_env),
         )
     elif code == "H":
         stage_H_relevance(
@@ -4521,7 +4595,7 @@ def run_stage(code: str, out_dir: Path, args: argparse.Namespace) -> None:
             llm_temperature=args.llm_temperature,
         )
     elif code == "I":
-        stage_I_pulse(out_dir, timeout=args.wb_timeout, sleep_s=args.sleep_reviews, resume=args.resume, strict=args.strict)
+        stage_I_pulse(out_dir, timeout=args.wb_timeout, sleep_s=args.sleep_reviews, resume=args.resume, strict=args.strict, trust_env=(not args.no_trust_env))
     elif code == "J":
         stage_J_supply(out_dir, resume=args.resume)
     elif code == "K":
@@ -5149,7 +5223,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sleep", type=float, default=0.35, help="Sleep между WB запросами (сек)")
     p.add_argument("--no-deep-card", action="store_true", help="Не тянуть wbbasket deep card.json")
     p.add_argument("--no-refetch-failed-lite", action="store_true", help="Stage G: не перезапрашивать fail-кэш competitor lite")
+    p.add_argument("--refetch-lite-all", action="store_true", help="Stage G: принудительно перезапросить все lite карточки (игнор кэша)")
     p.add_argument("--lite-cache-ttl-hours", type=int, default=36, help="Stage G: TTL ok-кэша competitor lite (часы)")
+    p.add_argument("--no-trust-env", action="store_true", help="WB стадии: отключить requests.Session().trust_env (игнор env-прокси)")
 
     p.add_argument("--lexicon", default="", help="Путь к lexicon.json (опционально)")
 
