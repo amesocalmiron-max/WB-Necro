@@ -1,0 +1,239 @@
+WB Revival — технический журнал передачи и изменений (change.log)
+===============================================================================
+
+Дата формирования: 2026-02-19 12:00 +0100 (Europe/Oslo)
+Назначение файла: единый инженерный handoff + changelog. Этот файл предполагается ДОПОЛНЯТЬ
+при каждой итерации (новые правки, диагностика, результаты прогонов).
+
+Короткое резюме
+--------------
+Проект: staged pipeline A..K для анализа и “реанимации” SKU на Wildberries.
+Состояние: архитектурно пайплайн почти готов (A..K, кэш, JSONL как канон, LLM только семантика),
+но прогон блокируется на Stage D (SERP Validate): метрика rel50 часто = 0, из-за чего Stage E
+получает пустой пул конкурентов. Требуется точечная диагностика причин отказа в serp_relevance_pass
+на конкретных SERP-ответах.
+
+Канон цели (V1.0 / Definition of Done)
+--------------------------------------
+Вход:
+- Excel: WB_INPUT_64_FROM_POCKETS_POD.xlsx (лист INPUT_64)
+- Скоуп: строго НЕ выходить за список nm_id из файла (исторически 64 SKU; позднее обсуждали AnyScope).
+
+Для каждого SKU:
+1) собрать OWN карточку WB (кэш сырья + нормализация)
+2) сгенерировать запросы (rules-first + LLM enrichment)
+3) дёрнуть SERP по запросам, валидировать запросы
+4) собрать пул конкурентов (hard filters) и вычистить мусор
+5) выбрать 1–5 конкурентов “по ролям”
+6) сравнить, посчитать gaps (контент, атрибуты, keyword gap)
+7) LLM-вердикт enum + причины + backlog + risk_flags + confidence
+8) отчёты XLSX + HTML + exec_summary по всем SKU
+
+Архитектурная идея:
+- Скрипт (детерминизм) делает WB сеть + кэш + числовую аналитику + отчёты.
+- LLM делает только семантику (запросы/релевантность/вердикт/summary), НЕ ходит в WB сеть
+  и НЕ добавляет конкурентов.
+
+Пайплайн A..K (контракт стадий)
+------------------------------
+
+Stage A — Input + Manifest
+- Вход: Excel INPUT_64
+- Действие: фиксирует scope (nm_id list), run_id, настройки
+- Выход: run_manifest.json
+
+Stage B — Collect OWN cards
+- Вход: scope из A
+- Действие: WB detail по nm_id, кэш сырья, нормализация
+- Выход:
+  - .wb_cache/nm_<id>/own_card.json
+  - own_norm.jsonl
+
+Stage C — Generate Queries (rules-first + LLM enrichment)
+- Вход: own_norm.jsonl
+- Действие:
+  - rules: шаблоны запросов (модель/тип/фича/материал)
+  - LLM: +2–4 вариации (если включено)
+  - fallback: rules всегда должны дать базовый набор
+- Выход: queries_raw.jsonl (запросы + must_terms + ban_terms)
+
+Stage D — SERP Validate Queries
+- Вход: queries_raw.jsonl
+- Действие: WB SERP top-50/100, SERP-метрики, отбор “живых” запросов
+- Выход:
+  - .wb_cache/.../serp_<hash>.json
+  - queries_valid.jsonl
+
+Stage E — Build Competitor Pool (hard filters)
+- Вход: SERP из D
+- Действие: пул кандидатов + жёсткие фильтры (case-like + must/ban)
+- Выход: competitor_pool.jsonl
+
+Stage F — Collect Competitor Cards
+- Вход: competitor_pool.jsonl
+- Действие: WB detail по кандидатам, кэш сырья, нормализация
+- Выход:
+  - .wb_cache/nm_<owner>/comp_<cid>.json
+  - competitor_norm.jsonl
+
+Stage G — LLM Relevance Filter (тонкая чистка)
+- Вход: 20–30 кандидатов (выжимки)
+- Действие: LLM KEEP/REJECT, НИЧЕГО НЕ ДОБАВЛЯЕТ
+- Выход: llm_relevance.jsonl
+
+Stage H — Select Final 1–5 Competitors (roles)
+- Вход: релевантный пул + карточки конкурентов
+- Действие: выбор ролей: LEADER, PRICE_FLOOR, PRICE_CEILING, CONTENT_BEAST, CLOSEST_MATCH
+- Выход: competitors_selected.jsonl
+
+Stage I — Compare + Score
+- Вход: own + selected competitors + SERP метрики
+- Действие: рынок/цены/монстры + gaps (content/attributes/keyword/features/materials)
+- Выход: comparison_metrics.jsonl
+
+Stage J — Verdict + Backlog (LLM)
+- Вход: выжимки own + 1–5 конкурентов + SERP метрики + gaps
+- Действие: LLM строгий JSON:
+  verdict enum, why[], backlog[], risk_flags[], confidence
+- Выход: decisions.jsonl
+
+Stage K — Render Reports + Executive Summary
+- Вход: decisions + metrics
+- Действие: XLSX+HTML витрина, exec_summary.json (опционально через LLM)
+- Выход: WB_REVIVE_<N>.xlsx, WB_REVIVE_<N>.html, exec_summary.json
+
+Режимы запуска (канонично под VPN-реальность)
+--------------------------------------------
+1) WB-only: A..F (без VPN)
+2) LLM-only: G..K (под VPN при необходимости)
+
+CLI пример:
+- A..F:
+  python <script>.py --start-stage A --end-stage F --resume --verbose
+- G..K:
+  python <script>.py --start-stage G --end-stage K --use-llm-relevance --use-llm-verdict --resume --verbose
+
+Важно про --resume:
+- При изменениях логики C/D/E нужно УДАЛЯТЬ соответствующие артефакты или запускать без --resume,
+  иначе будут использоваться старые queries_raw/queries_valid/competitor_pool.
+
+Обнаруженные проблемы в прогоне (факты)
+--------------------------------------
+
+P0: Stage D rel50=0
+- Симптом: для части SKU все запросы имеют rel50=0 при status=ok (SERP 200).
+- Следствие: Stage E часто формирует пустой пул (selected=0), дальше пайплайн деградирует.
+
+P0: Один SKU not_found
+- nm_id=179606053 стабильно 404 при попытках с разными dest.
+- Следствие: для него own_card пустой → запросы/анализ по нему мусорные.
+- Рекомендация: временно исключить из тестовых прогонов или исправить nm_id в Excel.
+
+P1: “Тощая карточка” из card.wb.ru detail
+- Detail часто не содержит description/опций/характеристик.
+- Идея (обсуждали): deep fetch из wbbasket /info/ru/card.json для description/options, затем merge в нормализацию.
+
+P1: Must-terms по модели “склеены” в одну строку с ';'
+- Наблюдалось в queries_raw.jsonl: модель может приходить мегастрокой с ';' и кодами.
+- Если serp_relevance_pass требует буквального вхождения must_terms, это убивает релевантность в ноль.
+- Попытки лечения делались (см. changelog), но эффект по факту не достигнут → нужна диагностика причин отказа.
+
+Что пытались чинить (и почему не сработало до конца)
+----------------------------------------------------
+
+- Попытка 1: смягчить pocket intent (карман → картхолдер/для карт/wallet и т.п.) в Stage E.
+  Результат: частично логично, но если Stage D режет всё в ноль из-за model-match/must_terms, Stage E не помогает.
+
+- Попытка 2: изменить Stage D так, чтобы НЕ валидировать запросы с rel50=0 (не пускать мусор дальше).
+  Результат: правильно по идее, но при массовом rel50=0 остаётся “нет валидных запросов”, то есть пайплайн всё равно пустеет.
+  Это не решение корня, а правильная реакция на проблему.
+
+- Попытка 3: нормализация моделей и must_terms (разбор ';', алиасы, очистка).
+  Результат: по пользовательскому прогону “всё так же” → вероятно, фиксы не применяются в нужной точке,
+  или условие отказа другое (subject/category match, жёсткий model tokenization и т.п.).
+
+Что надо сделать дальше (план диагностики, без гадания)
+------------------------------------------------------
+
+Шаг 1 — Диагностика serp_relevance_pass “почему отклонено” (обязательно)
+- Выбрать 1 проблемный SKU (например nm_id=196990787) и 1 запрос q_01.
+- Найти соответствующий SERP cache (серп_<hash>.json) для q_01.
+- Для top-50 кандидатов посчитать причины отклонения и агрегировать частоты:
+  - fail_case_like
+  - fail_subject/category
+  - fail_model
+  - fail_pocket
+  - fail_ban_terms
+  - fail_other
+- Вывести 5 примеров rejected с причинами (name + subjectId + ключевые поля).
+
+Шаг 2 — Исправить ровно главный “killer”
+- Если fail_model доминирует:
+  - сделать model-match по OR-группе вариантов (не строкой), токенизацией, поддержкой слитных форм, без бренда.
+- Если fail_subject/category доминирует:
+  - смягчить критерий: allow-list subjectId/parentId по данным own card, а не жёсткое равенство.
+- Если fail_pocket доминирует:
+  - расширить алиасы и/или сделать pocket “soft” для части запросов (не must для каждого).
+- Если fail_case_like доминирует:
+  - расширить “case-like” синонимы (чехол/кейс/накладка/бампер и т.п.).
+
+Шаг 3 — Перепрогон C..E без resume
+- Пересобрать queries_raw + queries_valid + competitor_pool.
+- Проверить: rel50 > 0 хотя бы на модельных запросах; Stage E даёт ненулевой пул.
+
+Артефакты и файлы (инвентарь)
+-----------------------------
+
+Исходные версии (загружены пользователем):
+- wb_revive_v1_0.py
+- wb_revive_v1_1.py
+- wb_revive_v1_1_2.py
+- wb_revive_v1_1_3.py
+- wb_revive_v1_2.py
+- wb_revive_v1_3.py
+- wb_revive_v1_3 another.py
+
+Патч/финалки, созданные в ходе работы:
+- wb_revive_final_v1_4.py (меню, фикс критических багов LLM парсинга и base_url)
+- wb_revive_final_v1_4_1_anyscope.py (AnyScope, expect-count/dedupe)
+- wb_revive_final_v1_5_deepcard.py (идея deep card через wbbasket card.json)
+- wb_revive_final_v1_5_1_poolfix.py (алиасы pocket для Stage E)
+- wb_revive_final_v1_5_2_stageDfix.py (Stage D: не пускать rel50=0 как valid; косметика логов)
+- wb_revive_final_v1_5_3_3_logicfix.py (попытка нормализовать модели/must_terms; не дало эффекта по факту)
+
+Артефакты прогонов (пример):
+- own_norm.jsonl (выход Stage B)
+- queries_raw.jsonl (выход Stage C)
+- queries_valid.jsonl (выход Stage D)
+- competitor_pool.jsonl (выход Stage E)
+- .wb_cache/ (сырьё карточек и SERP)
+
+Нюансы и “грабли”
+-----------------
+- Кэш и JSONL являются каноном. Excel только витрина.
+- Изменил логику стадий → не используй старые артефакты с --resume.
+- not_found SKU лучше убрать из теста, чтобы он не засорял статистику.
+- “Тощая карточка” detail может ухудшать семантику; deep card.json потенциально нужен.
+- Слишком строгие фильтры релевантности убивают rel50 → весь пайплайн пустеет.
+
+===============================================================================
+CHANGELOG (append-only)
+===============================================================================
+
+[2026-02-19] INIT — подготовлен handoff/change.log
+- Добавлено: описание цели, контракт стадий A..K, режимы запуска, факты проблем, план диагностики,
+  инвентарь файлов и патчей.
+- Статус: требуется диагностика Stage D (serp_relevance_pass) с агрегацией причин отказа.
+
+--- Шаблон для следующих записей (копируй вниз) ---
+[YYYY-MM-DD] <TAG/версия/кратко>
+- Изменено:
+  - ...
+- Почему:
+  - ...
+- Файлы:
+  - ...
+- Тест/результат:
+  - ...
+- Риски/заметки:
+  - ...
