@@ -3607,7 +3607,7 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
         type_skipped = not allow_type_check
 
         if type_skipped:
-            ty_status, ty_conf = "UNKNOWN", "LOW"
+            ty_status, ty_conf = "SKIPPED", "LOW"
             ty_pulse_flags, ty_pulse_rules, ty_pulse_lines = ["LOW_CONFIDENCE"], ["TYPE_SKIPPED_NO_PHONE_MODEL"], ["type-market skipped: phone_model отсутствует"]
             ty_supply_issues, ty_supply_rules, ty_supply_lines = [], [], []
             risk_flags.append("NO_PHONE_MODEL")
@@ -3687,6 +3687,26 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
             f"karma_rating={_fmt_num(rating)} feedbacks={_fmt_num(feedbacks,0)}",
         ]
 
+        def _rule_item(rid: str) -> Dict[str, Any]:
+            rid_s = safe_str(rid)
+            return {
+                "id": rid_s,
+                "inputs": {
+                    "phone_status": phone_status,
+                    "type_status": type_status,
+                    "rating": rating,
+                    "feedbacks": feedbacks,
+                    "risk_flags": sorted(set(risk_flags)),
+                },
+                "thresholds": {
+                    "karma_min_feedbacks": int(decision_cfg.get("karma_min_feedbacks", 30) or 30),
+                    "karma_min_rating": float(decision_cfg.get("karma_min_rating", 3.7) or 3.7),
+                },
+                "outcome": "applied",
+            }
+
+        rules_trace_list = [_rule_item(x) for x in sorted(set(ph_pulse_rules + ph_supply_rules + ty_pulse_rules + ty_supply_rules + decision_rules_fired))]
+
         decision_trace = {
             "phone_model": phone_model,
             "phone": {
@@ -3732,6 +3752,36 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
             "verdict_logic": sorted(set(ph_pulse_rules + ph_supply_rules + ty_pulse_rules + ty_supply_rules + decision_rules_fired)),
         }
 
+        explain = {
+            "market_gate": {
+                "phone": {"status": phone_status, "confidence": ph_conf, "why": (ph_pulse_lines + ph_supply_lines)[:3]},
+                "type": {"status": type_status, "confidence": ty_conf, "why": (["skipped due to missing phone_model"] if type_skipped else (ty_pulse_lines + ty_supply_lines)[:3])},
+            },
+            "supply_gate": {
+                "phone": (phone_row.get("supply") or {}),
+                "type": (type_row.get("supply") or {}),
+            },
+            "quality_gate": {
+                "flags": sorted(set([x for x in risk_flags if "LOW_CONFIDENCE" in safe_str(x) or x in ("REVIEWS_UNREACHABLE", "NO_PHONE_MODEL") or "UNKNOWN" in safe_str(x)])),
+                "skipped": ["TYPE skipped due to missing phone_model"] if type_skipped else [],
+            },
+            "final_call": {
+                "verdict": verdict,
+                "why": final_because,
+            },
+            "counterfactuals": {
+                "to_fast": [
+                    "Убрать LOW_CONFIDENCE*/UNKNOWN/REVIEWS_UNREACHABLE",
+                    "Сохранить PHONE!=DEAD и TYPE!=DEAD",
+                    "Без DUMPING_PRESSURE/MONOPOLY_DANGER и без TOXIC_KARMA",
+                ],
+                "to_drop": [
+                    "TYPE=DEAD при валидной проверке type-market",
+                    "Или PHONE=DEAD",
+                ],
+            },
+        }
+
         backlog_items, backlog_flat = build_backlog_items(verdict, sorted(set(risk_flags)), {
             "phone_status": phone_status,
             "type_status": type_status,
@@ -3747,6 +3797,8 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
                 "rationale": rationale[:14],
                 "rules_fired": sorted(set(ph_pulse_rules + ph_supply_rules + ty_pulse_rules + ty_supply_rules + decision_rules_fired)),
                 "decision_trace": decision_trace,
+                "decision_trace_rules": rules_trace_list,
+                "explain": explain,
                 "backlog_items": backlog_items,
                 "market": {"phone": phone_status, "type": type_status},
                 "karma": {"rating": rating, "feedbacks": feedbacks},
@@ -4283,6 +4335,8 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         dec_trace = (dec_full.get("decision_trace") or {})
         if not isinstance(dec_trace, dict):
             dec_trace = {}
+        explain_obj = dec_full.get("explain") if isinstance(dec_full.get("explain"), dict) else {}
+        trace_rules = dec_full.get("decision_trace_rules") if isinstance(dec_full.get("decision_trace_rules"), list) else []
         trace_phone = dec_trace.get("phone") if isinstance(dec_trace.get("phone"), dict) else {}
         trace_type = dec_trace.get("type") if isinstance(dec_trace.get("type"), dict) else {}
         cv_rows = (cluster_map.get(nm_key, {}).get("cluster_verdicts") or [])
@@ -4290,7 +4344,28 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         nm_key = safe_str(r.get("nm_id"))
         top_phone = _top_competitors(nm_key, "phone")
         top_type = _top_competitors(nm_key, "type")
-        evidence_html = _render_evidence("phone", trace_phone, cv_by_local.get("phone") or {}, top_phone) + _render_evidence("type", trace_type, cv_by_local.get("type") or {}, top_type)
+        tldr_items = []
+        mg = explain_obj.get("market_gate") if isinstance(explain_obj.get("market_gate"), dict) else {}
+        qg = explain_obj.get("quality_gate") if isinstance(explain_obj.get("quality_gate"), dict) else {}
+        fc = explain_obj.get("final_call") if isinstance(explain_obj.get("final_call"), dict) else {}
+        if mg:
+            ph = mg.get("phone") if isinstance(mg.get("phone"), dict) else {}
+            ty = mg.get("type") if isinstance(mg.get("type"), dict) else {}
+            tldr_items.append(f"PHONE: {safe_str(ph.get('status') or '—')} ({safe_str(ph.get('confidence') or '—')})")
+            tldr_items.append(f"TYPE: {safe_str(ty.get('status') or '—')} ({safe_str(ty.get('confidence') or '—')})")
+            why_ty = ty.get('why') if isinstance(ty.get('why'), list) else []
+            if safe_str(ty.get('status')) == 'SKIPPED' or any('skipped' in safe_str(x).lower() for x in why_ty):
+                tldr_items.append('TYPE skipped due to missing phone_model')
+        qflags = qg.get("flags") if isinstance(qg.get("flags"), list) else []
+        if qflags:
+            tldr_items.append("Quality gate: " + ", ".join([safe_str(x) for x in qflags[:4]]))
+        why_final = fc.get("why") if isinstance(fc.get("why"), list) else []
+        tldr_items.extend([safe_str(x) for x in why_final[:2]])
+        tldr_html = _render_items(tldr_items[:6], limit=6)
+        rules_html = "<details><summary>Rules fired</summary>" + _render_items([
+            f"{safe_str(x.get('id'))}: outcome={safe_str(x.get('outcome'))}" for x in trace_rules if isinstance(x, dict)
+        ], limit=20) + "</details>"
+        evidence_html = "<div><b>TL;DR</b>" + tldr_html + "</div>" + rules_html + _render_evidence("phone", trace_phone, cv_by_local.get("phone") or {}, top_phone) + _render_evidence("type", trace_type, cv_by_local.get("type") or {}, top_type)
 
         html_rows.append(f"""
 <tr class="row" data-nm="{rid}" data-verdict="{_html.escape(verdict)}" data-cats="{_html.escape(cat_attr)}">

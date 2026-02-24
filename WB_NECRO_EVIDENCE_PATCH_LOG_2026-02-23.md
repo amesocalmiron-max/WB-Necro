@@ -318,3 +318,26 @@
 - Никаких недостоверных «поэтических» чисел в summary.
 - Любые числовые claims в секции summary берутся только из вычисленных счётчиков.
 - Мусорные конструкции вида «поровну (28/58) …» больше не проходят в финальный отчёт.
+
+---
+
+## 11) Hotfix Stage L/M: объяснение решения (TL;DR + rules trace)
+
+### Проблема
+- Summary стал детерминированным, но по SKU это выглядело как «сброс метрик», а не объяснение решения.
+- Пользователь должен понимать вердикт по 3–6 тезисам, не вчитываясь в p10/p50.
+
+### Исправление
+- Stage L: расширен `decision`-блок:
+  - `decision_trace_rules`: список сработавших правил (id, inputs, thresholds, outcome),
+  - `explain`: структурированное объяснение (`market_gate`, `supply_gate`, `quality_gate`, `final_call`, `counterfactuals`).
+- Stage L: для случая без phone_model TYPE маркируется как `SKIPPED` (вместо фактического дрейфа в `DEAD/UNKNOWN`) и это попадает в explain.
+- Stage M HTML:
+  - добавлен блок `TL;DR` (3–6 bullets) перед сырой evidence-метрикой,
+  - добавлен `Rules fired` в отдельном collapsible,
+  - raw evidence сохранён в `Evidence` (как и раньше), но теперь не единственный источник смысла.
+
+### Проверка
+- `python -m py_compile WB_Necro.py`
+- `python WB_Necro.py --selftest`
+- synthetic прогон `stage_L_decisions + write_reports` с проверкой HTML на `TL;DR`, `Rules fired`, `TYPE skipped due to missing phone_model`.
