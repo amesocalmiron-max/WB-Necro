@@ -3238,9 +3238,27 @@ def stage_J_supply(out_dir: Path, *, resume: bool = False) -> Path:
             p10_ratio_lt = float(dump_cfg.get("p10_ratio_lt", 0.75))
             out_rate_gte = float(dump_cfg.get("outlier_rate_gte", 0.10))
             min_price_n = int(dump_cfg.get("min_price_n_or", 12))
-            if len(prices) >= min_price_n and p10 is not None and p50 is not None and unique_sellers >= min_unique:
-                if (p10 / p50) < p10_ratio_lt or outlier_rate >= out_rate_gte:
-                    flags.append("DUMPING_PRESSURE")
+            dumping_score = 0.0
+            ratio = (p10 / p50) if (p10 is not None and p50 not in (None, 0)) else None
+            if ratio is not None:
+                dumping_score += max(0.0, (p10_ratio_lt - ratio) / max(1e-6, p10_ratio_lt))
+            dumping_score += max(0.0, (outlier_rate - out_rate_gte))
+            if unique_sellers >= min_unique:
+                dumping_score += 0.1
+            dumping_score = max(0.0, min(1.0, dumping_score))
+
+            hard_ratio_lt = float(dump_cfg.get("hard_ratio_lt", max(0.50, p10_ratio_lt - 0.10)))
+            hard_outlier_gte = float(dump_cfg.get("hard_outlier_rate_gte", max(0.20, out_rate_gte)))
+            hard_dumping = bool(
+                len(prices) >= min_price_n
+                and ratio is not None
+                and ratio < hard_ratio_lt
+                and (outlier_rate >= hard_outlier_gte or unique_sellers >= min_unique)
+            )
+            if hard_dumping:
+                flags.append("DUMPING_PRESSURE")
+            elif ratio is not None and ratio < p10_ratio_lt:
+                flags.append("LOW_TAIL_PRICE")
 
             mono_cfg = thr.get("monopoly") or {}
             top1_gte = float(mono_cfg.get("top1_share_gte", 0.35))
@@ -3264,7 +3282,7 @@ def stage_J_supply(out_dir: Path, *, resume: bool = False) -> Path:
             out_clusters.append({
                 "cluster": cluster,
                 "n": len(prices),
-                "price": {"p10": p10, "p50": p50, "p90": p90, "trimmed_median": p_trim, "outlier_rate": round(outlier_rate, 4)},
+                "price": {"p10": p10, "p50": p50, "p90": p90, "trimmed_median": p_trim, "outlier_rate": round(outlier_rate, 4), "dumping_score": round(dumping_score, 4)},
                 "sellers": {"unique": unique_sellers, "top1_share": round(top1_share, 4), "hhi": round(hhi_val, 4)},
                 "stock": {"qty_median": median(qtys), "qty_n": len(qtys)},
                 "flags": flags,
@@ -3501,6 +3519,8 @@ def supply_explain(cluster_supply: dict, supply_thresholds: Dict[str, Any]) -> T
 
     if "DUMPING_PRESSURE" in flags:
         fired.append("SUPPLY_DUMPING_FLAG")
+    if "LOW_TAIL_PRICE" in flags:
+        fired.append("SUPPLY_LOW_TAIL_PRICE")
     if ratio is not None and ratio < float(dthr.get("p10_ratio_lt", 0.75)):
         fired.append("SUPPLY_DUMPING_RATIO")
         lines.append(f"price: p10/p50={_fmt_num(ratio,3)} (<{_fmt_num(dthr.get('p10_ratio_lt', 0.75),3)}) => DUMPING_PRESSURE")
@@ -3525,33 +3545,57 @@ def supply_explain(cluster_supply: dict, supply_thresholds: Dict[str, Any]) -> T
 def build_backlog_items(verdict: str, issues: List[str], context: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
     items: List[Dict[str, Any]] = []
 
-    def add(task: str, prio: int, tag: str, reason: str) -> None:
-        items.append({"task": task, "prio": int(prio), "tag": safe_str(tag), "reason": safe_str(reason)})
+    def add(task: str, prio: int, tag: str, reason: str, source: str = "") -> None:
+        items.append({"task": task, "prio": int(prio), "tag": safe_str(tag), "reason": safe_str(reason), "source": safe_str(source)})
 
     issue_set = set([safe_str(x) for x in (issues or [])])
+    phone_status = safe_str(context.get("phone_status"))
+    type_status = safe_str(context.get("type_status"))
+    phone_supply = context.get("phone_supply") if isinstance(context.get("phone_supply"), dict) else {}
+    type_supply = context.get("type_supply") if isinstance(context.get("type_supply"), dict) else {}
+
+    def _price_targets(supply: Dict[str, Any]) -> str:
+        price = supply.get("price") if isinstance(supply.get("price"), dict) else {}
+        p10 = safe_float(price.get("p10"), None)
+        p50 = safe_float(price.get("p50"), None)
+        p90 = safe_float(price.get("p90"), None)
+        p25 = (p10 + p50) / 2.0 if (p10 is not None and p50 is not None) else None
+        p75 = (p50 + p90) / 2.0 if (p50 is not None and p90 is not None) else None
+        entry = p25 if p25 is not None else p10
+        return f"targets: p25={_fmt_num(p25)} p50={_fmt_num(p50)} p75={_fmt_num(p75)} entry={_fmt_num(entry)}"
 
     if "REVIEWS_UNREACHABLE" in issue_set or "PHONE_MARKET_UNKNOWN" in issue_set or "TYPE_MARKET_UNKNOWN" in issue_set:
-        add("Перезапустить Stage I (reviews) и проверить сетевой контур WB (VPN OFF / endpoint feedbacks1/2).", 1, "data", "Недостаточно достижимых отзывов для уверенного статуса рынка.")
+        add("Перезапустить Stage I (reviews), проверить endpoint feedbacks1/2 и сетевой контур WB.", 1, "data", "Недостаточно достижимых отзывов для уверенного статуса рынка.", "REVIEWS_UNREACHABLE")
+
     if "DUMPING_PRESSURE" in issue_set:
-        add("Пересобрать ценовую стратегию: коридор p10/p50/p90, защита от демпинга, тест комплекта/ценности.", 1, "price", "Обнаружено демпинговое давление по рынку.")
+        add("Пересобрать ценовой коридор и entry-price по рынку; зафиксировать ценовые тесты и защиту от демпинга.", 1, "price", _price_targets(phone_supply or type_supply), "DUMPING_PRESSURE")
+    elif "LOW_TAIL_PRICE" in issue_set:
+        add("Проверить хвост низких цен: ограничить промо-дискаунты и выровнять карточку относительно медианы.", 2, "price", _price_targets(phone_supply or type_supply), "LOW_TAIL_PRICE")
+
     if "MONOPOLY_DANGER" in issue_set:
-        add("Сделать дифференциацию оффера: УТП, медиа, комплектация, вариативность, усилить SEO ядро.", 2, "content", "Высокая концентрация продавцов (монополизация).")
+        sellers = (phone_supply.get("sellers") if isinstance(phone_supply.get("sellers"), dict) else {}) or (type_supply.get("sellers") if isinstance(type_supply.get("sellers"), dict) else {})
+        add("Сделать дифференциацию: bundle/материал/feature-angle + проверить top1_share и HHI перед релизом.", 1, "content", f"sellers: unique={_fmt_num(sellers.get('unique'),0)} top1={_fmt_num(sellers.get('top1_share'),3)} hhi={_fmt_num(sellers.get('hhi'),3)}", "MONOPOLY_DANGER")
+
+    if phone_status == "ALIVE" and type_status == "DEAD":
+        add("Включить ALT_STRATEGY_OTHER_TYPE и протестировать альтернативные типы чехлов (silicone/armor/mag-safe/wallet-light).", 1, "seo", "PHONE alive при TYPE dead: нужен pivot в другой type-segment.", "ALT_STRATEGY_OTHER_TYPE")
+
     if "TOXIC_KARMA" in issue_set or verdict == "CLONE_NEW_CARD":
-        add("Клонировать карточку в новый SKU и перезапустить social proof (рейтинг/отзывы) с чистой кармой.", 1, "social", "Токсичная карма текущей карточки.")
+        add("Клонировать карточку в новый SKU и перезапустить social proof (рейтинг/отзывы).", 1, "social", "Токсичная карма текущей карточки.", "TOXIC_KARMA")
+
     if "NO_PHONE_MODEL" in issue_set:
-        add("Исправить извлечение phone_model из own-card: ручная нормализация атрибутов/заголовка, затем повтор C->L.", 1, "data", "Не извлечена модель телефона, type-market ненадёжен.")
+        add("Нормализовать извлечение phone_model и добавить model-токены в title/attributes для строгой релевантности.", 1, "data", "TYPE skipped из-за отсутствия phone_model.", "NO_PHONE_MODEL")
 
     if verdict in ("REVIVE_FAST", "REVIVE_REWORK", "CLONE_NEW_CARD"):
-        add("Собрать семантику отдельно для phone-market и type-market (TPU+карман).", 2, "seo", "Нужна связка запросов и контента под два рынка.")
-        add("Обновить карточку: заголовок/описание/характеристики и визуалы под фильтры WB.", 2, "content", "Поддержка ранжирования и конверсии.")
+        add("Собрать семантику отдельно для phone-market и type-market (TPU+карман).", 2, "seo", "Связка запросов и контента под два рынка.", "SEMANTIC_SPLIT")
+        add("Обновить карточку: заголовок/описание/характеристики и визуалы под фильтры WB.", 2, "content", "Поддержка ранжирования и конверсии.", "CONTENT_REFRESH")
 
     merged: Dict[str, Dict[str, Any]] = {}
     for it in items:
         t = it["task"]
         if t not in merged or int(it["prio"]) < int(merged[t]["prio"]):
             merged[t] = it
-    final_items = sorted(merged.values(), key=lambda x: (int(x.get("prio", 9)), safe_str(x.get("tag")), safe_str(x.get("task"))))
-    flat = [safe_str(x.get("task")) for x in final_items]
+    final_items = sorted(merged.values(), key=lambda x: (int(x.get("prio", 99)), safe_str(x.get("tag")), safe_str(x.get("task"))))
+    flat = [f"[{safe_str(i.get('tag'))}/P{safe_str(i.get('prio'))}] {safe_str(i.get('task'))} — {safe_str(i.get('reason'))}" for i in final_items]
     return final_items, flat
 
 def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
@@ -3786,6 +3830,8 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
             "phone_status": phone_status,
             "type_status": type_status,
             "phone_model": phone_model,
+            "phone_supply": phone_row.get("supply") or {},
+            "type_supply": type_row.get("supply") or {},
         })
 
         out_rec = {
@@ -4057,8 +4103,8 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     if use_exec_llm:
         try:
             prompt = (
-                "Сформируй только качественные текстовые заметки без чисел и без количественных утверждений. "
-                "Используй только JSON факты ниже как контекст, но в тексте НЕ ПИШИ ни одной цифры. "
+                "Сформируй содержательный SEO-style executive report человеческим языком: четкие выводы и план. "
+                "Используй только JSON факты ниже как контекст; не выдумывай метрики. "
                 "Верни строго JSON формата: {\"notes\":[str],\"plan_7d\":[str]} без других полей.\n\n"
                 "Факты (JSON):\n" + json.dumps(run_summary, ensure_ascii=False)
             )
@@ -4239,7 +4285,9 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
                 line = f"{badge}{task}"
                 if reason:
                     line += f" — {reason}"
-                lis.append(f"<li>{_html.escape(line)}</li>")
+                src = safe_str(it.get("source"))
+                title = f"why: {reason}" + (f" | rule: {src}" if src else "")
+                lis.append(f"<li title='{_html.escape(title)}'>{_html.escape(line)}</li>")
             html_parts.append(f"<div><span class='tag c-{_flag_category(tag)}'>{_html.escape(tag)}</span><ul>{''.join(lis)}</ul></div>")
         return ''.join(html_parts) if html_parts else (f"<pre>{_html.escape(fallback_text)}</pre>" if safe_str(fallback_text).strip() else "<span class='muted'>—</span>")
 

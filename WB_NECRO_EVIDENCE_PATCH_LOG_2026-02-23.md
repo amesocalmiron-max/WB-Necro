@@ -341,3 +341,29 @@
 - `python -m py_compile WB_Necro.py`
 - `python WB_Necro.py --selftest`
 - synthetic прогон `stage_L_decisions + write_reports` с проверкой HTML на `TL;DR`, `Rules fired`, `TYPE skipped due to missing phone_model`.
+
+---
+
+## 12) PR3/PR4: actionable backlog_items + softer dumping severity
+
+### PR3 (actionable, SKU-specific backlog)
+- `build_backlog_items(...)` теперь строит задачи из конкретных флагов/состояний и market context:
+  - `DUMPING_PRESSURE` → ценовой коридор с таргетами `p25/p50/p75` + entry-price;
+  - `MONOPOLY_DANGER` → дифференциация (bundle/material/feature-angle) + контроль top1/hhi;
+  - `PHONE_ALIVE + TYPE_DEAD` → `ALT_STRATEGY_OTHER_TYPE` и тест альтернативных case-types;
+  - `NO_PHONE_MODEL` → нормализация извлечения модели и добавление model-токенов в title/attrs.
+- В HTML “Что делать” задачи остаются группированы по tag и сортируются по prio; добавлен tooltip `why + rule` для каждой action-строки.
+
+### PR4 (optional): severity вместо паники по dumping)
+- В Stage J добавлен `dumping_score` (0..1) на основе ratio/outlier/seller context.
+- Жёсткий `DUMPING_PRESSURE` теперь включается только при hard-условиях (`hard_ratio_lt`, `hard_outlier_rate_gte`, достаточный `price_n`).
+- Для мягких случаев добавляется `LOW_TAIL_PRICE`, который не обязан автоматически уводить решение в жёсткий rework-path.
+
+### LLM напоминание для Stage M
+- LLM path для exec-summary оставлен и переформулирован как «SEO-style executive report человеческим языком», но с жёстким grounding на JSON facts и валидацией схемы.
+
+### Проверка
+- `python -m py_compile WB_Necro.py`
+- `python WB_Necro.py --selftest`
+- ad-hoc check: `build_backlog_items(...)` для разных issues возвращает разные action-наборы.
+- synthetic Stage L/M run + HTML screenshot для визуальной проверки TL;DR/Rules/Actionability.
