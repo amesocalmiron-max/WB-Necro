@@ -2166,6 +2166,13 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
         content = (v4.get("content") or {}) if isinstance(v4.get("content"), dict) else {}
         return bool(ids.get("nm_id") or content.get("title"))
 
+    def _is_fetch_ok(card: Any) -> bool:
+        if not isinstance(card, dict):
+            return False
+        st = safe_str(card.get("status")).lower()
+        http = safe_int(card.get("http"), 0)
+        return bool(http == 200 and st.startswith("ok"))
+
     def _should_refetch(card: Any, cpath: Path) -> Tuple[bool, str]:
         if refetch_all:
             return True, "force_refetch_all"
@@ -2173,7 +2180,7 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
             return True, "cache_miss"
         st = safe_str(card.get("status"))
         http = safe_int(card.get("http"), 0)
-        if st != "ok" or http != 200:
+        if not _is_fetch_ok(card):
             return (bool(refetch_failed), f"cached_fail status={st} http={http}")
         if not _is_payload_ok(card):
             return True, "invalid_payload"
@@ -2242,7 +2249,7 @@ def stage_G_lite(out_dir: Path, *, timeout: int, sleep_s: float, resume: bool,
                 try:
                     cls = _classify_http(card if isinstance(card, dict) else {})
                     http_bins[cls] = http_bins.get(cls, 0) + 1
-                    if safe_str(card.get("status")) == "ok" and int(card.get("http") or 0) == 200 and _is_payload_ok(card):
+                    if _is_fetch_ok(card) and _is_payload_ok(card):
                         ok_n += 1
                     else:
                         fail_n += 1
