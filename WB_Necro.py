@@ -3937,6 +3937,8 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     market_type_counts = Counter()
     risk_flags_counter = Counter()
     backlog_counter = Counter()
+    backlog_tag_counter = Counter()
+    backlog_prio_counter = Counter()
 
     for r in rows:
         verdict_counts[safe_str(r.get("verdict") or "UNKNOWN")] += 1
@@ -3948,43 +3950,70 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         for bl in [x.strip("• ").strip() for x in safe_str(r.get("backlog") or "").splitlines() if x.strip()]:
             backlog_counter[bl] += 1
 
-    # ---------- опц LLM: делаем человеческую выжимку, чтобы отчёт был не только для робота ----------
+        nm_key = safe_str(r.get("nm_id"))
+        dec = ((decision_map.get(nm_key) or {}).get("decision") or {})
+        for bi in (dec.get("backlog_items") or []):
+            if not isinstance(bi, dict):
+                continue
+            btag = safe_str(bi.get("tag") or "other").lower()
+            bprio = safe_int(bi.get("prio"), None)
+            backlog_tag_counter[btag] += 1
+            if bprio is not None:
+                backlog_prio_counter[f"P{int(bprio)}"] += 1
+
+    # ---------- deterministic summary (from JSONL only) ----------
+    run_summary = {
+        "run_id": run_id,
+        "total": len(rows),
+        "counts_by_verdict": {k: int(verdict_counts.get(k, 0)) for k in ("REVIVE_FAST", "REVIVE_REWORK", "CLONE_NEW_CARD", "DROP")},
+        "market_phone": {k: int(market_phone_counts.get(k, 0)) for k in ("ALIVE", "SLOW", "DEAD", "SKIPPED", "UNKNOWN")},
+        "market_type": {k: int(market_type_counts.get(k, 0)) for k in ("ALIVE", "SLOW", "DEAD", "SKIPPED", "UNKNOWN")},
+        "top_risk_flags": [{"flag": k, "count": int(v)} for k, v in risk_flags_counter.most_common(12)],
+        "top_backlog_tasks": [{"task": k, "count": int(v)} for k, v in backlog_counter.most_common(12)],
+        "top_backlog_by_tag": [{"tag": k, "count": int(v)} for k, v in backlog_tag_counter.most_common(12)],
+        "top_backlog_by_prio": [{"prio": k, "count": int(v)} for k, v in backlog_prio_counter.most_common(12)],
+    }
+
+    # ---------- optional LLM notes (no numbers allowed) ----------
     exec_summary: Optional[dict] = None
     exec_path = out_dir / "exec_summary.json"
-    if args is not None and getattr(args, "use_llm_m", False):
+
+    def _contains_digits_any(x: Any) -> bool:
+        if isinstance(x, str):
+            return bool(re.search(r"\d", x))
+        if isinstance(x, list):
+            return any(_contains_digits_any(i) for i in x)
+        if isinstance(x, dict):
+            return any(_contains_digits_any(v) for v in x.values())
+        return False
+
+    def _validate_exec_notes(obj: Any) -> Optional[dict]:
+        if not isinstance(obj, dict):
+            return None
+        notes = obj.get("notes") if isinstance(obj.get("notes"), list) else []
+        plan = obj.get("plan_7d") if isinstance(obj.get("plan_7d"), list) else []
+        if not all(isinstance(x, str) for x in notes + plan):
+            return None
+        if _contains_digits_any({"notes": notes, "plan_7d": plan}):
+            return None
+        return {
+            "notes": [safe_str(x).strip() for x in notes if safe_str(x).strip()][:12],
+            "plan_7d": [safe_str(x).strip() for x in plan if safe_str(x).strip()][:12],
+        }
+
+    use_exec_llm = bool(args is not None and (getattr(args, "use_llm_m", False) or getattr(args, "use_llm_exec_summary", False)))
+    if use_exec_llm:
         try:
-            facts = {
-                "run_id": run_id,
-                "total": len(rows),
-                "counts_by_verdict": dict(verdict_counts),
-                "market_phone": dict(market_phone_counts),
-                "market_type": dict(market_type_counts),
-                "top_risk_flags": [{"flag": k, "count": v} for k, v in risk_flags_counter.most_common(12)],
-                "top_backlog_tasks": [{"task": k, "count": v} for k, v in backlog_counter.most_common(12)],
-            }
-
             prompt = (
-                "Сделай подробную и прикладную выжимку отчёта для бизнеса. "
-                "ВАЖНО: не выдумывай числа и факты, используй только JSON ниже. "
-                "Вывод строго JSON без текста вокруг.\n\n"
-                "Схема вывода:\n"
-                "{\n"
-                "  \"title\": str,\n"
-                "  \"summary_md\": str,\n"
-                "  \"key_points\": [str],\n"
-                "  \"risks\": [str],\n"
-                "  \"next_steps\": [str],\n"
-                "  \"priority_actions\": [str],\n"
-                "  \"focus_segments\": [str]\n"
-                "}\n\n"
-                "Факты (JSON):\n" + json.dumps(facts, ensure_ascii=False)
+                "Сформируй только качественные текстовые заметки без чисел и без количественных утверждений. "
+                "Используй только JSON факты ниже как контекст, но в тексте НЕ ПИШИ ни одной цифры. "
+                "Верни строго JSON формата: {\"notes\":[str],\"plan_7d\":[str]} без других полей.\n\n"
+                "Факты (JSON):\n" + json.dumps(run_summary, ensure_ascii=False)
             )
-
             messages = [
-                {"role": "system", "content": "Ты senior-аналитик WB. Пиши по делу, без воды. Числа только из фактов."},
+                {"role": "system", "content": "Ты senior-аналитик WB. Только краткие заметки и план без цифр."},
                 {"role": "user", "content": prompt},
             ]
-
             key = llm_api_key(args.llm_provider)
             resp, meta = call_llm_json(
                 provider=args.llm_provider,
@@ -3997,11 +4026,13 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
                 temperature=float(args.llm_temperature),
                 force_json=True,
             )
-            if isinstance(resp, dict) and resp:
-                exec_summary = resp
-                exec_summary["_meta"] = meta
+            valid = _validate_exec_notes(resp)
+            if valid is not None:
+                exec_summary = {**valid, "_meta": meta}
                 exec_path.write_text(json.dumps(exec_summary, ensure_ascii=False, indent=2), encoding="utf-8")
-                stage_dbg("M", f"LLM exec summary -> {exec_path}")
+                stage_dbg("M", f"LLM exec notes -> {exec_path}")
+            else:
+                stage_warn("M", "LLM exec summary rejected by validator (digits/invalid schema). Using deterministic summary.")
         except Exception as e:
             stage_warn("M", f"LLM exec summary failed: {safe_str(e)}")
 
@@ -4020,27 +4051,38 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     ws2["A2"] = "created_at"; ws2["B2"] = (manifest.get("meta") or {}).get("created_at")
     ws2["A3"] = "script_version"; ws2["B3"] = (manifest.get("meta") or {}).get("script_version")
     autosize_columns(ws2)
-
+    ws3 = wb.create_sheet("SUMMARY")
+    ws3["A1"] = "Deterministic run summary"
+    ws3["A3"] = "counts_by_verdict"
+    ws3["A4"] = json.dumps(run_summary.get("counts_by_verdict") or {}, ensure_ascii=False)
+    ws3["A6"] = "market_phone"
+    ws3["A7"] = json.dumps(run_summary.get("market_phone") or {}, ensure_ascii=False)
+    ws3["A9"] = "market_type"
+    ws3["A10"] = json.dumps(run_summary.get("market_type") or {}, ensure_ascii=False)
+    ws3["A12"] = "top_risk_flags"
+    rr = run_summary.get("top_risk_flags") or []
+    for i, x in enumerate(rr[:12], start=13):
+        ws3[f"A{i}"] = f"- {safe_str(x.get('flag'))}: {safe_str(x.get('count'))}"
+    base = 13 + len(rr[:12]) + 1
+    ws3[f"A{base}"] = "top_backlog_by_tag"
+    bt = run_summary.get("top_backlog_by_tag") or []
+    for j, x in enumerate(bt[:12], start=base+1):
+        ws3[f"A{j}"] = f"- {safe_str(x.get('tag'))}: {safe_str(x.get('count'))}"
+    base2 = base + 1 + len(bt[:12]) + 1
+    ws3[f"A{base2}"] = "top_backlog_by_prio"
+    bp = run_summary.get("top_backlog_by_prio") or []
+    for k, x in enumerate(bp[:12], start=base2+1):
+        ws3[f"A{k}"] = f"- {safe_str(x.get('prio'))}: {safe_str(x.get('count'))}"
     if exec_summary:
-        ws3 = wb.create_sheet("SUMMARY")
-        ws3["A1"] = safe_str(exec_summary.get("title") or "Executive Summary")
-        ws3["A3"] = "summary_md"
-        ws3["A4"] = safe_str(exec_summary.get("summary_md") or "")
-        ws3["A6"] = "key_points"
-        kp = exec_summary.get("key_points") or []
-        for i, x in enumerate(kp, start=7):
-            ws3[f"A{i}"] = f"- {safe_str(x)}"
-        rr = exec_summary.get("risks") or []
-        base = 7 + len(kp) + 1
-        ws3[f"A{base}"] = "risks"
-        for j, x in enumerate(rr, start=base+1):
-            ws3[f"A{j}"] = f"- {safe_str(x)}"
-        ns = exec_summary.get("next_steps") or []
-        base2 = base + 1 + len(rr) + 1
-        ws3[f"A{base2}"] = "next_steps"
-        for k, x in enumerate(ns, start=base2+1):
-            ws3[f"A{k}"] = f"- {safe_str(x)}"
-        autosize_columns(ws3)
+        b3 = base2 + 1 + len(bp[:12]) + 1
+        ws3[f"A{b3}"] = "llm_notes (no numbers)"
+        for m, x in enumerate((exec_summary.get("notes") or [])[:12], start=b3+1):
+            ws3[f"A{m}"] = f"- {safe_str(x)}"
+        b4 = b3 + 1 + len((exec_summary.get("notes") or [])[:12]) + 1
+        ws3[f"A{b4}"] = "llm_plan_7d (no numbers)"
+        for n, x in enumerate((exec_summary.get("plan_7d") or [])[:12], start=b4+1):
+            ws3[f"A{n}"] = f"- {safe_str(x)}"
+    autosize_columns(ws3)
 
     ws_ev_m = wb.create_sheet("EVIDENCE_MARKET")
     ev_m_headers = [
@@ -4348,13 +4390,8 @@ applyFilters();
     top_flags = [f"{k} ({v})" for k, v in risk_flags_counter.most_common(10)]
     top_tasks = [f"{k} ({v})" for k, v in backlog_counter.most_common(10)]
 
-    headline = safe_str((exec_summary or {}).get("title") or "Executive Summary")
-    summary_md = safe_str((exec_summary or {}).get("summary_md") or "")
-    key_points = (exec_summary or {}).get("key_points") if isinstance((exec_summary or {}).get("key_points"), list) else []
-    risks = (exec_summary or {}).get("risks") if isinstance((exec_summary or {}).get("risks"), list) else []
-    next_steps = (exec_summary or {}).get("next_steps") if isinstance((exec_summary or {}).get("next_steps"), list) else []
-    priority_actions = (exec_summary or {}).get("priority_actions") if isinstance((exec_summary or {}).get("priority_actions"), list) else []
-    focus_segments = (exec_summary or {}).get("focus_segments") if isinstance((exec_summary or {}).get("focus_segments"), list) else []
+    llm_notes = (exec_summary or {}).get("notes") if isinstance((exec_summary or {}).get("notes"), list) else []
+    llm_plan = (exec_summary or {}).get("plan_7d") if isinstance((exec_summary or {}).get("plan_7d"), list) else []
 
     sku_n = max(1, len(rows))
     sku_with_phone_model = sum(1 for r in rows if safe_str(r.get("phone_model")))
@@ -4412,21 +4449,26 @@ applyFilters();
     summary_block = f"""
 <div class='summary'>
   <section class='panel'>
-    <h2>{_html.escape(headline)}</h2>
+    <h2>Deterministic summary</h2>
     <div class='muted mono'>run_id={_html.escape(run_id)}</div>
-    <p>{_html.escape(summary_md).replace(chr(10), '<br>') if summary_md else '<span class="muted">LLM summary выключен или недоступен.</span>'}</p>
+    <ul>
+      <li>verdict_counts: {_html.escape(json.dumps(run_summary.get('counts_by_verdict') or {}, ensure_ascii=False))}</li>
+      <li>market_phone: {_html.escape(json.dumps(run_summary.get('market_phone') or {}, ensure_ascii=False))}</li>
+      <li>market_type: {_html.escape(json.dumps(run_summary.get('market_type') or {}, ensure_ascii=False))}</li>
+    </ul>
   </section>
   <section class='panel'>
-    <h2>Ключевые выводы</h2>
-    {_render_items(key_points or top_flags, limit=12)}
+    <h2>Ключевые выводы (deterministic)</h2>
+    {_render_items([f"{x.get('flag')}: {x.get('count')}" for x in (run_summary.get('top_risk_flags') or [])], limit=12)}
   </section>
   <section class='panel'>
-    <h2>Риски и фокус</h2>
-    {_render_items((risks or top_flags) + (focus_segments or []), limit=12)}
+    <h2>Backlog структура</h2>
+    {_render_items([f"tag {x.get('tag')}: {x.get('count')}" for x in (run_summary.get('top_backlog_by_tag') or [])] + [f"prio {x.get('prio')}: {x.get('count')}" for x in (run_summary.get('top_backlog_by_prio') or [])], limit=12)}
   </section>
   <section class='panel'>
     <h2>План действий</h2>
-    {_render_items((next_steps or []) + (priority_actions or []) + (top_tasks or []), limit=12)}
+    {_render_items([f"{x.get('task')}: {x.get('count')}" for x in (run_summary.get('top_backlog_tasks') or [])], limit=12)}
+    {_render_items((llm_notes + llm_plan), limit=12) if (llm_notes or llm_plan) else "<div class='muted'>LLM notes выключены или отклонены валидатором.</div>"}
   </section>
 </div>"""
 
@@ -5258,6 +5300,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--use-llm-d", action="store_true", help="LLM обогащение запросов (Stage D)")
     p.add_argument("--use-llm-h", action="store_true", help="LLM для пограничной релевантности (Stage H)")
     p.add_argument("--use-llm-m", action="store_true", help="LLM выжимка для отчёта (Stage M: exec summary)")
+    p.add_argument("--use-llm-exec-summary", action="store_true", help="Alias: LLM заметки для Stage M exec summary")
     p.add_argument("--llm-provider", choices=["openai", "openrouter"], default=os.environ.get("LLM_PROVIDER","openrouter"))
     p.add_argument("--llm-model", default=os.environ.get("LLM_MODEL", MODEL_PRESETS.get(os.environ.get("LLM_PROVIDER","openrouter"), MODEL_PRESETS["openrouter"])["default"]))
     p.add_argument("--llm-base-url", default=os.environ.get("LLM_BASE_URL",""))
@@ -5403,6 +5446,9 @@ def main(argv: Optional[List[str]] = None) -> None:
                 f"LLM=D:{args.use_llm_d} H:{args.use_llm_h} M:{args.use_llm_m} "
                 f"max_tokens=D:{args.llm_max_tokens_d} H:{args.llm_max_tokens_h} M:{args.llm_max_tokens_m} "
                 f"keep={args.min_keep_competitors}..{args.max_keep_competitors}")
+
+    if getattr(args, "use_llm_exec_summary", False):
+        args.use_llm_m = True
 
     if args.list_stages:
         print_stage_table(args)
