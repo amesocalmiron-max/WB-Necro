@@ -3886,8 +3886,11 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     decision_map = map_by_nm(out_dir / "decisions.jsonl")
     lite_map = map_by_nm(out_dir / "competitor_lite.jsonl")
     rel_map = map_by_nm(out_dir / "relevance.jsonl")
+    pulse_map = map_by_nm(out_dir / "market_pulse.jsonl")
+    supply_map = map_by_nm(out_dir / "supply_structure.jsonl")
 
     rows: List[Dict[str, Any]] = []
+    story_rows: List[Dict[str, Any]] = []
     evidence_market_rows: List[Dict[str, Any]] = []
     evidence_supply_rows: List[Dict[str, Any]] = []
 
@@ -3920,6 +3923,135 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             })
         out = sorted(out, key=lambda x: ((safe_float(x.get("price"), 10**9) or 10**9), -(safe_float(x.get("rating"), 0.0) or 0.0), -(safe_int(x.get("feedbacks"), 0) or 0)))
         return out[:5]
+
+    def _trace_cluster_status(cluster: str, nm: str, cv_cluster: Dict[str, Any], intent_obj: Dict[str, Any], rel_cluster: Dict[str, Any]) -> str:
+        status = safe_str(cv_cluster.get("market_status") or "")
+        if status:
+            if cluster == "type" and status == "DEAD":
+                if not safe_str(intent_obj.get("phone_model") or ""):
+                    return "SKIPPED"
+                if safe_int(rel_cluster.get("keep_n"), 0) <= 0:
+                    keep = rel_cluster.get("keep") if isinstance(rel_cluster.get("keep"), list) else []
+                    if len(keep) == 0:
+                        return "SKIPPED"
+            return status
+        if cluster == "type":
+            if not safe_str(intent_obj.get("phone_model") or ""):
+                return "SKIPPED"
+            if safe_int(rel_cluster.get("keep_n"), 0) <= 0:
+                keep = rel_cluster.get("keep") if isinstance(rel_cluster.get("keep"), list) else []
+                if len(keep) == 0:
+                    return "SKIPPED"
+        return "UNKNOWN"
+
+    def build_sku_story(nm: str, *, row_obj: Dict[str, Any], decision_obj: Dict[str, Any], cv_by_obj: Dict[str, Any], intent_obj: Dict[str, Any], rel_by_obj: Dict[str, Any], pulse_by_obj: Dict[str, Any], supply_by_obj: Dict[str, Any]) -> Dict[str, Any]:
+        explain = decision_obj.get("explain") if isinstance(decision_obj.get("explain"), dict) else {}
+        trace = decision_obj.get("decision_trace") if isinstance(decision_obj.get("decision_trace"), dict) else {}
+        trace_phone = trace.get("phone") if isinstance(trace.get("phone"), dict) else {}
+        trace_type = trace.get("type") if isinstance(trace.get("type"), dict) else {}
+
+        cv_phone = cv_by_obj.get("phone") if isinstance(cv_by_obj.get("phone"), dict) else {}
+        cv_type = cv_by_obj.get("type") if isinstance(cv_by_obj.get("type"), dict) else {}
+        rel_phone = rel_by_obj.get("phone") if isinstance(rel_by_obj.get("phone"), dict) else {}
+        rel_type = rel_by_obj.get("type") if isinstance(rel_by_obj.get("type"), dict) else {}
+        pulse_phone = pulse_by_obj.get("phone") if isinstance(pulse_by_obj.get("phone"), dict) else {}
+        pulse_type = pulse_by_obj.get("type") if isinstance(pulse_by_obj.get("type"), dict) else {}
+        supply_phone = supply_by_obj.get("phone") if isinstance(supply_by_obj.get("phone"), dict) else {}
+        supply_type = supply_by_obj.get("type") if isinstance(supply_by_obj.get("type"), dict) else {}
+
+        def _pick_block(cluster: str, trace_block: Dict[str, Any], cv_block: Dict[str, Any], pulse_block: Dict[str, Any], supply_block: Dict[str, Any], rel_block: Dict[str, Any]) -> Dict[str, Any]:
+            base = trace_block if trace_block else {}
+            pulse = base.get("pulse") if isinstance(base.get("pulse"), dict) else (cv_block.get("pulse") or pulse_block or {})
+            supply = base.get("supply") if isinstance(base.get("supply"), dict) else (cv_block.get("supply") or supply_block or {})
+            status = _trace_cluster_status(cluster, nm, cv_block, intent_obj, rel_block)
+            if trace_block:
+                status = safe_str(trace_block.get("status") or status or "UNKNOWN")
+            conf = safe_str(base.get("confidence") or cv_block.get("confidence") or "LOW")
+            issues = base.get("issues") if isinstance(base.get("issues"), list) else (cv_block.get("issues") or [])
+            rules = base.get("rules_fired") if isinstance(base.get("rules_fired"), list) else []
+            return {"status": status or "UNKNOWN", "confidence": conf, "pulse": pulse if isinstance(pulse, dict) else {}, "supply": supply if isinstance(supply, dict) else {}, "issues": [safe_str(x) for x in issues if safe_str(x)], "rules_fired": [safe_str(x) for x in rules if safe_str(x)]}
+
+        phone = _pick_block("phone", trace_phone, cv_phone, pulse_phone, supply_phone, rel_phone)
+        typ = _pick_block("type", trace_type, cv_type, pulse_type, supply_type, rel_type)
+
+        if typ.get("status") == "SKIPPED" and not typ.get("issues"):
+            if not safe_str(intent_obj.get("phone_model") or ""):
+                typ["issues"] = ["NO_PHONE_MODEL"]
+            else:
+                typ["issues"] = ["TYPE_POOL_EMPTY"]
+
+        quality_flags = []
+        for fl in (decision_obj.get("risk_flags") or []):
+            f = safe_str(fl)
+            if not f:
+                continue
+            if ("LOW_CONFIDENCE" in f) or ("UNREACH" in f) or ("CAPPED" in f) or ("SKIPPED" in f) or ("UNKNOWN" in f):
+                quality_flags.append(f)
+        if not trace:
+            quality_flags.append("MISSING_DECISION_TRACE")
+        if typ.get("status") == "SKIPPED":
+            quality_flags.append("TYPE_SKIPPED")
+
+        def _cluster_fact_line(label: str, b: Dict[str, Any]) -> str:
+            p = b.get("pulse") if isinstance(b.get("pulse"), dict) else {}
+            s = b.get("supply") if isinstance(b.get("supply"), dict) else {}
+            pr = (s.get("price") or {}) if isinstance(s, dict) else {}
+            return (
+                f"{label}: status={safe_str(b.get('status') or 'UNKNOWN')} ({safe_str(b.get('confidence') or 'LOW')}), "
+                f"r30={_fmt_num(p.get('recent_30_median'))}, r90={_fmt_num(p.get('recent_90_median'))}, "
+                f"dsl_min={_fmt_num(p.get('days_since_last_min'))}, unreach={_fmt_num(p.get('unreachable_share'),3)}, "
+                f"price_n={_fmt_num(s.get('n'),0)}, p10/p50={_fmt_num(pr.get('p10'))}/{_fmt_num(pr.get('p50'))}"
+            )
+
+        why_bullets: List[str] = [
+            _cluster_fact_line("PHONE", phone),
+            _cluster_fact_line("TYPE", typ),
+        ]
+        final_call = explain.get("final_call") if isinstance(explain.get("final_call"), dict) else {}
+        for x in (final_call.get("why") if isinstance(final_call.get("why"), list) else []):
+            if safe_str(x):
+                why_bullets.append(safe_str(x))
+        if typ.get("status") == "SKIPPED":
+            why_bullets.append("TYPE=SKIPPED: отсутствует phone_model или пустой релевантный TYPE-пул (keep_n=0).")
+        if not trace:
+            why_bullets.append("Нет decision_trace: перезапусти Stage L для этого run.")
+        if quality_flags:
+            why_bullets.append("Качество данных ограничивает уверенность: " + ", ".join(sorted(set(quality_flags))[:6]))
+
+        why_bullets = [x for x in why_bullets if safe_str(x)]
+        if len(why_bullets) < 4:
+            why_bullets.append("Недостаточно структурных объяснений из Stage L: добавь decision_trace/explain.")
+        why_bullets = why_bullets[:7]
+
+        verdict = safe_str(row_obj.get("verdict") or "UNKNOWN")
+        main_reason = safe_str(why_bullets[0] if why_bullets else "Нет фактов")
+        tl_dr = f"{verdict}: {main_reason}"
+
+        cf = explain.get("counterfactuals") if isinstance(explain.get("counterfactuals"), list) else []
+        counterfactuals = [safe_str(x) for x in cf if safe_str(x)][:4]
+        if not counterfactuals:
+            counterfactuals = [
+                "Для FAST: убрать LOW_CONFIDENCE*/UNKNOWN и подтвердить цены/релевантность.",
+                "Для DROP: устойчиво DEAD по PHONE/TYPE при достаточном объёме данных.",
+            ]
+
+        bitems = [x for x in (decision_obj.get("backlog_items") or []) if isinstance(x, dict)]
+        top_actions = sorted(
+            bitems,
+            key=lambda x: (safe_int(x.get("prio"), 99), safe_str(x.get("tag")), safe_str(x.get("task"))),
+        )[:5]
+        if not top_actions:
+            top_actions = [{"tag": "other", "prio": 3, "task": safe_str(x), "reason": "legacy_backlog"} for x in (decision_obj.get("backlog") or [])[:5]]
+
+        return {
+            "tl_dr": tl_dr,
+            "why_bullets": why_bullets,
+            "phone_block": phone,
+            "type_block": typ,
+            "data_quality": sorted(set([x for x in quality_flags if x])),
+            "counterfactuals": counterfactuals,
+            "top_actions": top_actions,
+        }
     for sku in scope:
         nm = nm_id_to_str(sku.get("nm_id"))
         vc = safe_str(sku.get("vendor_code", ""))
@@ -3956,10 +4088,25 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
                 )
             return "\n".join(bits)
 
+        rel_clusters = {safe_str(x.get("cluster")): x for x in ((rel_map.get(nm, {}) or {}).get("clusters") or []) if isinstance(x, dict)}
+
         def _ms(cluster: str) -> str:
-            return safe_str((cv_by.get(cluster) or {}).get("market_status") or "")
+            return _trace_cluster_status(cluster, nm, (cv_by.get(cluster) or {}), intent, (rel_clusters.get(cluster) or {}))
         def _issues(cluster: str) -> str:
             return ", ".join((cv_by.get(cluster) or {}).get("issues") or [])
+
+        pulse_clusters = {safe_str(x.get("cluster")): x for x in ((pulse_map.get(nm, {}) or {}).get("clusters") or []) if isinstance(x, dict)}
+        supply_clusters = {safe_str(x.get("cluster")): x for x in ((supply_map.get(nm, {}) or {}).get("clusters") or []) if isinstance(x, dict)}
+        story = build_sku_story(
+            nm,
+            row_obj={"verdict": verdict},
+            decision_obj=dec,
+            cv_by_obj=cv_by,
+            intent_obj=intent,
+            rel_by_obj=rel_clusters,
+            pulse_by_obj=pulse_clusters,
+            supply_by_obj=supply_clusters,
+        )
 
         rows.append({
             "nm_id": nm,
@@ -3979,7 +4126,27 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
             "rules_fired": ", ".join([safe_str(x) for x in rules_fired]),
             "top_comp_phone": _comp_flat(top_phone),
             "top_comp_type": _comp_flat(top_type),
+            "story_tl_dr": safe_str(story.get("tl_dr")),
+            "story_why": "\n".join([f"• {safe_str(x)}" for x in (story.get("why_bullets") or [])]),
+            "story_quality": ", ".join([safe_str(x) for x in (story.get("data_quality") or [])]),
+            "story_actions": "\n".join([
+                f"[{safe_str(x.get('tag') or 'other')}] P{safe_str(x.get('prio') or '3')}: {safe_str(x.get('task') or '')} — {safe_str(x.get('reason') or '')}"
+                for x in (story.get("top_actions") or []) if isinstance(x, dict)
+            ]),
             "url": wb_product_url(nm),
+        })
+        story_rows.append({
+            "nm_id": nm,
+            "vendor_code": vc,
+            "name": name,
+            "verdict": verdict,
+            "tl_dr": safe_str(story.get("tl_dr")),
+            "why_bullets": "\n".join([f"• {safe_str(x)}" for x in (story.get("why_bullets") or [])]),
+            "data_quality": ", ".join([safe_str(x) for x in (story.get("data_quality") or [])]),
+            "top_actions": "\n".join([
+                f"[{safe_str(x.get('tag') or 'other')}] P{safe_str(x.get('prio') or '3')}: {safe_str(x.get('task') or '')} — {safe_str(x.get('reason') or '')}"
+                for x in (story.get("top_actions") or []) if isinstance(x, dict)
+            ]),
         })
 
         for cluster, ev in (("phone", ev_phone), ("type", ev_type)):
@@ -4037,6 +4204,14 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
     backlog_counter = Counter()
     backlog_tag_counter = Counter()
     backlog_prio_counter = Counter()
+    quality_reason_counter = Counter()
+
+    sku_with_phone_model = 0
+    sku_type_evaluated = 0
+    clusters_total = 0
+    clusters_price_ok = 0
+    clusters_reviews_capped = 0
+    clusters_reviews_unreachable = 0
 
     for r in rows:
         verdict_counts[safe_str(r.get("verdict") or "UNKNOWN")] += 1
@@ -4045,10 +4220,31 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
 
         for fl in [x.strip() for x in safe_str(r.get("risk_flags") or "").split(",") if x.strip()]:
             risk_flags_counter[fl] += 1
+            if ("LOW_CONFIDENCE" in fl) or ("REVIEWS_" in fl) or ("TYPE_SKIPPED" in fl) or ("UNKNOWN" in fl):
+                quality_reason_counter[fl] += 1
         for bl in [x.strip("• ").strip() for x in safe_str(r.get("backlog") or "").splitlines() if x.strip()]:
             backlog_counter[bl] += 1
 
         nm_key = safe_str(r.get("nm_id"))
+        if safe_str(r.get("phone_model")):
+            sku_with_phone_model += 1
+        if safe_str(r.get("market_type")) not in {"", "SKIPPED"}:
+            sku_type_evaluated += 1
+
+        ev_clusters = [x for x in evidence_supply_rows if safe_str(x.get("nm_id")) == nm_key]
+        for ev in ev_clusters:
+            clusters_total += 1
+            n_price = safe_int(ev.get("n"), 0)
+            if n_price >= safe_int((((supply_thresholds or {}).get("dumping") or {}).get("min_price_n_or")), 5):
+                clusters_price_ok += 1
+        m_clusters = [x for x in evidence_market_rows if safe_str(x.get("nm_id")) == nm_key]
+        for evm in m_clusters:
+            un_share = safe_float(evm.get("unreachable_share"), 0.0)
+            if un_share >= 0.5:
+                clusters_reviews_unreachable += 1
+            issues = [x.strip() for x in safe_str(evm.get("issues") or "").split(",") if x.strip()]
+            if any("CAPPED" in x for x in issues):
+                clusters_reviews_capped += 1
         dec = ((decision_map.get(nm_key) or {}).get("decision") or {})
         for bi in (dec.get("backlog_items") or []):
             if not isinstance(bi, dict):
@@ -4070,6 +4266,14 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         "top_backlog_tasks": [{"task": k, "count": int(v)} for k, v in backlog_counter.most_common(12)],
         "top_backlog_by_tag": [{"tag": k, "count": int(v)} for k, v in backlog_tag_counter.most_common(12)],
         "top_backlog_by_prio": [{"prio": k, "count": int(v)} for k, v in backlog_prio_counter.most_common(12)],
+        "top_quality_degradation": [{"reason": k, "count": int(v)} for k, v in quality_reason_counter.most_common(12)],
+        "data_quality": {
+            "sku_phone_model_pct": (sku_with_phone_model / max(len(rows), 1)),
+            "sku_type_evaluated_pct": (sku_type_evaluated / max(len(rows), 1)),
+            "cluster_price_coverage_pct": (clusters_price_ok / max(clusters_total, 1)),
+            "cluster_reviews_capped_pct": (clusters_reviews_capped / max(clusters_total, 1)),
+            "cluster_reviews_unreachable_pct": (clusters_reviews_unreachable / max(clusters_total, 1)),
+        },
     }
 
     # ---------- optional LLM notes (no numbers allowed) ----------
@@ -4204,6 +4408,13 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         ws_ev_s.append([rr.get(h) for h in ev_s_headers])
     autosize_columns(ws_ev_s)
 
+    ws_story = wb.create_sheet("STORY")
+    story_headers = ["nm_id", "vendor_code", "name", "verdict", "tl_dr", "why_bullets", "data_quality", "top_actions"]
+    ws_story.append(story_headers)
+    for sr in story_rows:
+        ws_story.append([sr.get(h) for h in story_headers])
+    autosize_columns(ws_story)
+
     ws_thr = wb.create_sheet("THRESHOLDS")
     ws_thr.append(["key", "value"])
     for k, v in sorted((pulse_rules or {}).items()):
@@ -4336,15 +4547,39 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         )
         return f"<details><summary>{_html.escape(cluster.upper())}: {_html.escape(status)} ({_html.escape(conf)})</summary>{body}</details>"
 
-    def validate_report_rows(rows_data: List[Dict[str, Any]], decision_mp: Dict[str, Any], cluster_mp: Dict[str, Any]) -> None:
+    def validate_report_rows(rows_data: List[Dict[str, Any]], decision_mp: Dict[str, Any], cluster_mp: Dict[str, Any], rel_mp: Dict[str, Any]) -> Dict[str, Any]:
+        warn_n = 0
+        low_story_n = 0
+        type_skip_wo_reason_n = 0
+        low_price_rows_n = 0
+        reviews_capped_rows_n = 0
         for rr in rows_data:
             nm = safe_str(rr.get("nm_id"))
             dec = ((decision_mp.get(nm) or {}).get("decision") or {})
             cv = ((cluster_mp.get(nm) or {}).get("cluster_verdicts") or [])
             tr = dec.get("decision_trace") if isinstance(dec.get("decision_trace"), dict) else {}
+            story_empty = (not safe_str(rr.get("story_tl_dr"))) and (not safe_str(rr.get("story_why")))
+            if safe_str(dec.get("verdict")) and story_empty:
+                warn_n += 1
+                low_story_n += 1
+                stage_warn("M", f"[{nm}] verdict есть, но story пустой")
             if safe_str(dec.get("verdict")) and not tr:
+                warn_n += 1
                 stage_warn("M", f"[{nm}] verdict есть, но decision_trace пустой (fallback будет ограничен)")
 
+            rel_by = {safe_str(x.get("cluster")): x for x in ((rel_mp.get(nm, {}) or {}).get("clusters") or []) if isinstance(x, dict)}
+            r_type = rel_by.get("type") or {}
+            if safe_int(r_type.get("keep_n"), 0) <= 0:
+                decision_trace = dec.get("decision_trace") if isinstance(dec.get("decision_trace"), dict) else {}
+                t_block = decision_trace.get("type") if isinstance(decision_trace.get("type"), dict) else {}
+                issues = t_block.get("issues") if isinstance(t_block.get("issues"), list) else []
+                if not any(safe_str(x) in {"NO_PHONE_MODEL", "TYPE_POOL_EMPTY"} for x in issues):
+                    warn_n += 1
+                    type_skip_wo_reason_n += 1
+                    stage_warn("M", f"[{nm}] TYPE keep_n=0, но skip_reason не указан")
+
+            row_has_low_price = False
+            row_has_capped = False
             for cl in cv:
                 if not isinstance(cl, dict):
                     continue
@@ -4353,11 +4588,41 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
                 supply = cl.get("supply") or {}
                 flags = (supply.get("flags") or []) if isinstance(supply, dict) else []
                 if st == "UNKNOWN" and (pulse.get("unreachable_share") is None):
+                    warn_n += 1
                     stage_warn("M", f"[{nm}:{safe_str(cl.get('cluster'))}] status UNKNOWN, но unreachable_share отсутствует")
                 if "DUMPING_PRESSURE" in flags:
                     pr = (supply.get("price") or {}) if isinstance(supply, dict) else {}
                     if pr.get("p10") is None or pr.get("p50") is None:
+                        warn_n += 1
                         stage_warn("M", f"[{nm}:{safe_str(cl.get('cluster'))}] DUMPING_PRESSURE без p10/p50")
+                if safe_int(supply.get("n"), 0) < safe_int((((supply_thresholds or {}).get("dumping") or {}).get("min_price_n_or")), 5):
+                    row_has_low_price = True
+                cl_issues = cl.get("issues") if isinstance(cl.get("issues"), list) else []
+                if any("CAPPED" in safe_str(x) for x in cl_issues):
+                    row_has_capped = True
+            low_price_rows_n += 1 if row_has_low_price else 0
+            reviews_capped_rows_n += 1 if row_has_capped else 0
+
+        if len(rows_data) > 0 and low_price_rows_n > (len(rows_data) // 2):
+            warn_n += 1
+            stage_warn("M", "Большинство SKU имеют price_n ниже порога: недостаточно цен")
+        if len(rows_data) > 0 and reviews_capped_rows_n > (len(rows_data) // 3):
+            warn_n += 1
+            stage_warn("M", "Высокая доля REVIEWS_CAPPED: точность пульса снижена")
+
+        run_quality = "HIGH"
+        if warn_n >= max(2, len(rows_data) // 3):
+            run_quality = "LOW"
+        elif warn_n > 0:
+            run_quality = "MEDIUM"
+        return {
+            "warnings": warn_n,
+            "run_quality": run_quality,
+            "low_story_rows": low_story_n,
+            "type_skip_without_reason": type_skip_wo_reason_n,
+            "low_price_rows": low_price_rows_n,
+            "reviews_capped_rows": reviews_capped_rows_n,
+        }
 
     html_rows = []
     for r in rows:
@@ -4383,37 +4648,47 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
         dec_trace = (dec_full.get("decision_trace") or {})
         if not isinstance(dec_trace, dict):
             dec_trace = {}
-        explain_obj = dec_full.get("explain") if isinstance(dec_full.get("explain"), dict) else {}
         trace_rules = dec_full.get("decision_trace_rules") if isinstance(dec_full.get("decision_trace_rules"), list) else []
         trace_phone = dec_trace.get("phone") if isinstance(dec_trace.get("phone"), dict) else {}
         trace_type = dec_trace.get("type") if isinstance(dec_trace.get("type"), dict) else {}
         cv_rows = (cluster_map.get(nm_key, {}).get("cluster_verdicts") or [])
         cv_by_local = {safe_str(x.get("cluster")): x for x in cv_rows if isinstance(x, dict)}
+        rel_rows = (rel_map.get(nm_key, {}).get("clusters") or [])
+        rel_by_local = {safe_str(x.get("cluster")): x for x in rel_rows if isinstance(x, dict)}
+        pulse_rows = (pulse_map.get(nm_key, {}).get("clusters") or [])
+        pulse_by_local = {safe_str(x.get("cluster")): x for x in pulse_rows if isinstance(x, dict)}
+        supply_rows = (supply_map.get(nm_key, {}).get("clusters") or [])
+        supply_by_local = {safe_str(x.get("cluster")): x for x in supply_rows if isinstance(x, dict)}
+        intent_local = (intent_map.get(nm_key, {}).get("intent") or {})
         nm_key = safe_str(r.get("nm_id"))
         top_phone = _top_competitors(nm_key, "phone")
         top_type = _top_competitors(nm_key, "type")
-        tldr_items = []
-        mg = explain_obj.get("market_gate") if isinstance(explain_obj.get("market_gate"), dict) else {}
-        qg = explain_obj.get("quality_gate") if isinstance(explain_obj.get("quality_gate"), dict) else {}
-        fc = explain_obj.get("final_call") if isinstance(explain_obj.get("final_call"), dict) else {}
-        if mg:
-            ph = mg.get("phone") if isinstance(mg.get("phone"), dict) else {}
-            ty = mg.get("type") if isinstance(mg.get("type"), dict) else {}
-            tldr_items.append(f"PHONE: {safe_str(ph.get('status') or '—')} ({safe_str(ph.get('confidence') or '—')})")
-            tldr_items.append(f"TYPE: {safe_str(ty.get('status') or '—')} ({safe_str(ty.get('confidence') or '—')})")
-            why_ty = ty.get('why') if isinstance(ty.get('why'), list) else []
-            if safe_str(ty.get('status')) == 'SKIPPED' or any('skipped' in safe_str(x).lower() for x in why_ty):
-                tldr_items.append('TYPE skipped due to missing phone_model')
-        qflags = qg.get("flags") if isinstance(qg.get("flags"), list) else []
-        if qflags:
-            tldr_items.append("Quality gate: " + ", ".join([safe_str(x) for x in qflags[:4]]))
-        why_final = fc.get("why") if isinstance(fc.get("why"), list) else []
-        tldr_items.extend([safe_str(x) for x in why_final[:2]])
-        tldr_html = _render_items(tldr_items[:6], limit=6)
+        story = build_sku_story(
+            nm_key,
+            row_obj=r,
+            decision_obj=dec_full,
+            cv_by_obj=cv_by_local,
+            intent_obj=intent_local,
+            rel_by_obj=rel_by_local,
+            pulse_by_obj=pulse_by_local,
+            supply_by_obj=supply_by_local,
+        )
+        tldr_html = _render_items([safe_str(story.get("tl_dr"))], limit=2)
+        why_html = _render_items([safe_str(x) for x in (story.get("why_bullets") or [])], limit=8)
+        quality_html = _render_items([safe_str(x) for x in (story.get("data_quality") or [])], limit=8)
+        cf_html = _render_items([safe_str(x) for x in (story.get("counterfactuals") or [])], limit=6)
         rules_html = "<details><summary>Rules fired</summary>" + _render_items([
             f"{safe_str(x.get('id'))}: outcome={safe_str(x.get('outcome'))}" for x in trace_rules if isinstance(x, dict)
         ], limit=20) + "</details>"
-        evidence_html = "<div><b>TL;DR</b>" + tldr_html + "</div>" + rules_html + _render_evidence("phone", trace_phone, cv_by_local.get("phone") or {}, top_phone) + _render_evidence("type", trace_type, cv_by_local.get("type") or {}, top_type)
+        evidence_html = (
+            "<div><b>TL;DR</b>" + tldr_html + "</div>"
+            + "<div><b>Почему</b>" + why_html + "</div>"
+            + "<div><b>Data quality</b>" + quality_html + "</div>"
+            + "<div><b>Counterfactuals</b>" + cf_html + "</div>"
+            + rules_html
+            + _render_evidence("phone", trace_phone, cv_by_local.get("phone") or {}, top_phone)
+            + _render_evidence("type", trace_type, cv_by_local.get("type") or {}, top_type)
+        )
 
         html_rows.append(f"""
 <tr class="row" data-nm="{rid}" data-verdict="{_html.escape(verdict)}" data-cats="{_html.escape(cat_attr)}">
@@ -4432,7 +4707,7 @@ def write_reports(out_dir: Path, args: Optional[argparse.Namespace] = None, *, t
   </td>
   <td>{evidence_html}</td>
   <td>{flags_html}</td>
-  <td><details><summary>Почему так</summary><pre>{_html.escape(rationale_text)}</pre></details></td>
+  <td><details><summary>Почему так</summary>{why_html}<pre>{_html.escape(rationale_text)}</pre></details></td>
   <td><details><summary>Что делать</summary>{backlog_html}</details></td>
 </tr>
 """)
@@ -4516,33 +4791,14 @@ applyFilters();
     llm_notes = (exec_summary or {}).get("notes") if isinstance((exec_summary or {}).get("notes"), list) else []
     llm_plan = (exec_summary or {}).get("plan_7d") if isinstance((exec_summary or {}).get("plan_7d"), list) else []
 
-    sku_n = max(1, len(rows))
-    sku_with_phone_model = sum(1 for r in rows if safe_str(r.get("phone_model")))
-    price_good_n = 0
-    type_eval_n = 0
-    reviews_unreach_n = 0
     min_price_n_gate = int((supply_thresholds.get("dumping") or {}).get("min_price_n_or", 12))
-    for r in rows:
-        nm = safe_str(r.get("nm_id"))
-        dec = ((decision_map.get(nm) or {}).get("decision") or {})
-        tr = dec.get("decision_trace") if isinstance(dec.get("decision_trace"), dict) else {}
-        ty = tr.get("type") if isinstance(tr.get("type"), dict) else {}
-        if safe_str(ty.get("status")) and not bool(ty.get("skipped")):
-            type_eval_n += 1
-        for cl in ("phone", "type"):
-            c = tr.get(cl) if isinstance(tr.get(cl), dict) else {}
-            supply = c.get("supply") if isinstance(c.get("supply"), dict) else {}
-            if safe_int(supply.get("n"), 0) >= min_price_n_gate:
-                price_good_n += 1
-            pulse = c.get("pulse") if isinstance(c.get("pulse"), dict) else {}
-            if safe_float(pulse.get("unreachable_share"), 0.0) >= 0.5:
-                reviews_unreach_n += 1
-
-    q_phone = sku_with_phone_model / sku_n
-    q_type = type_eval_n / sku_n
-    q_price = price_good_n / (sku_n * 2)
-    q_reviews = reviews_unreach_n / (sku_n * 2)
-    quality_score = (q_phone + q_type + q_price + (1.0 - q_reviews)) / 4.0
+    q_obj = run_summary.get("data_quality") if isinstance(run_summary.get("data_quality"), dict) else {}
+    q_phone = safe_float(q_obj.get("sku_phone_model_pct"), 0.0)
+    q_type = safe_float(q_obj.get("sku_type_evaluated_pct"), 0.0)
+    q_price = safe_float(q_obj.get("cluster_price_coverage_pct"), 0.0)
+    q_reviews_capped = safe_float(q_obj.get("cluster_reviews_capped_pct"), 0.0)
+    q_reviews_unreach = safe_float(q_obj.get("cluster_reviews_unreachable_pct"), 0.0)
+    quality_score = (q_phone + q_type + q_price + (1.0 - q_reviews_unreach)) / 4.0
     run_quality = "HIGH" if quality_score >= 0.75 else ("MED" if quality_score >= 0.5 else "LOW")
 
     cards_html = f"""
@@ -4563,7 +4819,8 @@ applyFilters();
       <li>% SKU с phone_model: {_fmt_num(q_phone * 100, 1)}%</li>
       <li>% SKU с TYPE оценкой (not skipped): {_fmt_num(q_type * 100, 1)}%</li>
       <li>% кластеров с price_n &gt;= {min_price_n_gate}: {_fmt_num(q_price * 100, 1)}%</li>
-      <li>% кластеров с reviews_unreachable (&gt;=0.5): {_fmt_num(q_reviews * 100, 1)}%</li>
+      <li>% кластеров с reviews_partial_window_90 (cap): {_fmt_num(q_reviews_capped * 100, 1)}%</li>
+      <li>% кластеров с reviews_unreachable (&gt;=0.5): {_fmt_num(q_reviews_unreach * 100, 1)}%</li>
     </ul>
     <div class='muted'>Run quality: <b>{run_quality}</b></div>
   </section>
@@ -4583,6 +4840,10 @@ applyFilters();
   <section class='panel'>
     <h2>Ключевые выводы (deterministic)</h2>
     {_render_items([f"{x.get('flag')}: {x.get('count')}" for x in (run_summary.get('top_risk_flags') or [])], limit=12)}
+  </section>
+  <section class='panel'>
+    <h2>Причины деградации качества</h2>
+    {_render_items([f"{x.get('reason')}: {x.get('count')}" for x in (run_summary.get('top_quality_degradation') or [])], limit=12)}
   </section>
   <section class='panel'>
     <h2>Backlog структура</h2>
@@ -4659,7 +4920,9 @@ applyFilters();
 <script>{js}</script>
 </body></html>
 """
-    validate_report_rows(rows, decision_map, cluster_map)
+    val_state = validate_report_rows(rows, decision_map, cluster_map, rel_map)
+    if safe_str(val_state.get("run_quality")) == "LOW":
+        stage_warn("M", f"report validator marked run_quality=LOW (warnings={safe_int(val_state.get('warnings'), 0)})")
     out_html.write_text(html_doc, encoding='utf-8')
 
     stage_dbg("M", f"wrote {out_xlsx} + {out_html}")
@@ -5447,6 +5710,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def run_selftests() -> None:
+    fixture_story = json.loads((Path('tests/fixtures/stage_m_story_fixture.json')).read_text(encoding='utf-8')) if Path('tests/fixtures/stage_m_story_fixture.json').exists() else {}
+    fixture_llm = json.loads((Path('tests/fixtures/stage_m_llm_reject_fixture.json')).read_text(encoding='utf-8')) if Path('tests/fixtures/stage_m_llm_reject_fixture.json').exists() else {}
+    assert isinstance(fixture_story, dict) and isinstance(fixture_llm, dict), 'fixtures must be readable JSON'
+
     # test 1: parse_card_v4 must extract price from sizes.price
     js = {
         "data": {
@@ -5523,7 +5790,65 @@ def run_selftests() -> None:
         globals()['fetch_card_any'] = orig_fetch
     assert calls2['n'] >= 1, 'Stage G should refetch stale cache by TTL'
 
-    print("[SELFTEST] OK: parse_card_v4, strict/any relevance, confidence cap, Stage G refetch+TTL")
+    # test 6: Stage M deterministic summary + story + TYPE SKIPPED rendering
+    td_m = Path(tempfile.mkdtemp(prefix='wb_selftest_m_'))
+    ensure_dir(td_m)
+    write_json(td_m / 'run_manifest.json', {
+        'meta': {'run_id': 'selftest_m', 'created_at': datetime.now().isoformat(timespec='seconds'), 'script_version': SCRIPT_VERSION},
+        'config': {
+            'pulse_rules': DEFAULT_PULSE_RULES,
+            'supply_thresholds': DEFAULT_SUPPLY_THRESHOLDS,
+            'decision': DEFAULT_DECISION_CFG,
+        },
+        'scope': {'sku_list': [{'nm_id': '1001', 'vendor_code': 'v1', 'name': 'Case A'}]},
+    })
+    append_jsonl(td_m / 'intent.jsonl', {'meta': make_meta('selftest_m', 'A', '1001', 'v1', 'Case A'), 'intent': {'phone_model': '', 'karma': {'rating': 4.5, 'feedbacks': 32}}})
+    append_jsonl(td_m / 'relevance.jsonl', {'meta': make_meta('selftest_m', 'E', '1001', 'v1', 'Case A'), 'clusters': [{'cluster': 'phone', 'keep_n': 1, 'keep': [{'nm_id': '2001'}]}, {'cluster': 'type', 'keep_n': 0, 'keep': []}]})
+    append_jsonl(td_m / 'market_pulse.jsonl', {'meta': make_meta('selftest_m', 'I', '1001', 'v1', 'Case A'), 'clusters': [{'cluster': 'phone', 'market_status': 'ALIVE', 'confidence': 'MEDIUM', 'agg': {'imt_n': 4, 'imt_with_data_n': 4, 'unreachable_share': 0.0, 'recent_30_median': 2, 'recent_90_median': 3, 'days_since_last_min': 10, 'days_since_last_median': 16}}, {'cluster': 'type', 'market_status': 'UNKNOWN', 'confidence': 'LOW', 'agg': {'imt_n': 2, 'imt_with_data_n': 0, 'unreachable_share': 1.0}}]})
+    append_jsonl(td_m / 'supply_structure.jsonl', {'meta': make_meta('selftest_m', 'J', '1001', 'v1', 'Case A'), 'clusters': [{'cluster': 'phone', 'supply': {'n': 4, 'price': {'p10': 500, 'p50': 650, 'p90': 790}, 'sellers': {'unique': 4, 'top1_share': 0.35, 'hhi': 0.25}, 'stock': {'qty_median': 7, 'qty_n': 4}, 'flags': []}}, {'cluster': 'type', 'supply': {'n': 0, 'price': {}, 'sellers': {}, 'stock': {}, 'flags': ['LOW_CONFIDENCE_PRICE']}}]})
+    append_jsonl(td_m / 'cluster_verdicts.jsonl', {'meta': make_meta('selftest_m', 'K', '1001', 'v1', 'Case A'), 'cluster_verdicts': [
+        {'cluster': 'phone', 'market_status': 'ALIVE', 'confidence': 'MEDIUM', 'pulse': {'imt_n': 4, 'imt_with_data_n': 4, 'unreachable_share': 0.0, 'recent_30_median': 2, 'recent_90_median': 3, 'days_since_last_min': 10, 'days_since_last_median': 16}, 'supply': {'n': 4, 'price': {'p10': 500, 'p50': 650, 'p90': 790, 'trimmed_median': 640, 'outlier_rate': 0.1}, 'sellers': {'unique': 4, 'top1_share': 0.35, 'hhi': 0.25}, 'stock': {'qty_median': 7, 'qty_n': 4}, 'flags': []}, 'issues': []},
+        {'cluster': 'type', 'market_status': 'DEAD', 'confidence': 'LOW', 'pulse': {'imt_n': 2, 'imt_with_data_n': 0, 'unreachable_share': 1.0}, 'supply': {'n': 0, 'price': {}, 'sellers': {}, 'stock': {}, 'flags': ['LOW_CONFIDENCE_PRICE']}, 'issues': ['NO_PHONE_MODEL']},
+    ]})
+    append_jsonl(td_m / 'competitor_lite.jsonl', {'meta': make_meta('selftest_m', 'G', '1001', 'v1', 'Case A'), 'clusters': [{'cluster': 'phone', 'items': [{'nm_id': '2001', 'seed': {'name': 'Comp A', 'seller_name': 'SellerX'}, 'card': {'v4': {'content': {'title': 'Comp A', 'seller': 'SellerX'}, 'pricing': {'client_price_rub': 590}, 'metrics': {'rating': 4.7, 'feedbacks': 150}}}}]}, {'cluster': 'type', 'items': []}]})
+    append_jsonl(td_m / 'decisions.jsonl', {'meta': make_meta('selftest_m', 'L', '1001', 'v1', 'Case A'), 'decision': {
+        'verdict': 'REVIVE_REWORK',
+        'risk_flags': ['LOW_CONFIDENCE_PRICE', 'NO_PHONE_MODEL'],
+        'rationale': ['type skipped due to missing phone model'],
+        'backlog': ['normalize phone model'],
+        'rules_fired': ['DECISION_CAP_FAST_BY_LOW_CONFIDENCE'],
+        'backlog_items': [{'task': 'Normalize phone_model extraction', 'prio': 1, 'tag': 'data', 'reason': 'NO_PHONE_MODEL'}],
+    }})
+    xlsx_p, html_p = write_reports(td_m, args=None, title='selftest M')
+    html_txt = html_p.read_text(encoding='utf-8')
+    assert 'Deterministic summary' in html_txt and 'TL;DR' in html_txt, 'Stage M summary/story missing'
+    assert 'TYPE: SKIPPED' in html_txt or 'TYPE=SKIPPED' in html_txt, 'TYPE SKIPPED must be explicit'
+    assert xlsx_p.exists(), 'Stage M xlsx missing'
+
+    # test 7: LLM notes with digits must be rejected and fallback to deterministic
+    from argparse import Namespace
+    old_call = globals().get('call_llm_json')
+    def _fake_llm(**kwargs):
+        return ({'notes': ['Рост на 25%'], 'plan_7d': ['Сделать 3 шага']}, {'provider': 'fake'})
+    globals()['call_llm_json'] = _fake_llm
+    args_m = Namespace(
+        use_llm_m=True,
+        use_llm_exec_summary=True,
+        llm_provider='openrouter',
+        llm_model='dummy',
+        llm_base_url='',
+        llm_timeout=30,
+        llm_max_tokens_m=300,
+        llm_temperature=0.0,
+    )
+    try:
+        _, html_p2 = write_reports(td_m, args=args_m, title='selftest M llm reject')
+    finally:
+        globals()['call_llm_json'] = old_call
+    html_txt2 = html_p2.read_text(encoding='utf-8')
+    assert 'LLM notes выключены или отклонены валидатором.' in html_txt2, 'LLM numeric text must be rejected'
+
+    print("[SELFTEST] OK: parse_card_v4, strict/any relevance, confidence cap, Stage G refetch+TTL, Stage M summary/story")
 
 
 def main(argv: Optional[List[str]] = None) -> None:

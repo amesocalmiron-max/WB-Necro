@@ -1,0 +1,9 @@
+{
+  "llm_response": {
+    "notes": ["Рост на 25%"],
+    "plan_7d": ["Сделать 3 шага"]
+  },
+  "expected": {
+    "validator": "reject_digits"
+  }
+}

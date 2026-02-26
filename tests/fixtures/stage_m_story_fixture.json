@@ -1,0 +1,14 @@
+{
+  "run_id": "fixture_stage_m",
+  "sku": {
+    "nm_id": "1001",
+    "vendor_code": "v1",
+    "name": "Case A",
+    "phone_model": ""
+  },
+  "expected": {
+    "type_status": "SKIPPED",
+    "requires_story": true,
+    "requires_tldr": true
+  }
+}
