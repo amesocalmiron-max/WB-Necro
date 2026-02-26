@@ -3679,13 +3679,16 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
             rationale.append("PHONE рынок UNKNOWN: данных недостаточно, требуется повтор Stage I и ручная проверка.")
         else:
             force_rework = False
+            forced_verdict = False
             if not allow_type_check:
                 verdict = "REVIVE_REWORK"
+                forced_verdict = True
                 risk_flags.append("LOW_CONFIDENCE")
                 decision_rules_fired.append("DECISION_NO_PHONE_MODEL_REWORK")
                 rationale.append("Type-market пропущен из-за отсутствия phone_model, решение с пониженной уверенностью.")
             elif type_status == "DEAD":
                 verdict = "DROP"
+                forced_verdict = True
                 risk_flags.append("TYPE_MARKET_DEAD")
                 decision_rules_fired.append("DECISION_TYPE_DEAD_DROP")
                 rationale.append("TYPE рынок мёртв: для TPU+карман оживление нецелесообразно.")
@@ -3701,19 +3704,22 @@ def stage_L_decisions(out_dir: Path, *, resume: bool = False) -> Path:
             karma_min_rating = float(decision_cfg.get("karma_min_rating", 3.7) or 3.7)
             karma_toxic = karma_is_toxic(rating, feedbacks, min_fb=karma_min_fb, min_rating=karma_min_rating)
 
-            if karma_toxic:
-                verdict = "CLONE_NEW_CARD"
-                risk_flags.append("TOXIC_KARMA")
-                decision_rules_fired.append("DECISION_KARMA_TOXIC_CLONE")
-            elif "DUMPING_PRESSURE" in risk_flags or "MONOPOLY_DANGER" in risk_flags:
-                verdict = "REVIVE_REWORK"
-                decision_rules_fired.append("DECISION_SUPPLY_RISK_REWORK")
-            else:
-                verdict = "REVIVE_FAST"
-                decision_rules_fired.append("DECISION_MARKET_OK_FAST")
-                if 'force_rework' in locals() and force_rework:
+            if not forced_verdict:
+                if karma_toxic:
+                    verdict = "CLONE_NEW_CARD"
+                    risk_flags.append("TOXIC_KARMA")
+                    decision_rules_fired.append("DECISION_KARMA_TOXIC_CLONE")
+                elif "DUMPING_PRESSURE" in risk_flags or "MONOPOLY_DANGER" in risk_flags:
                     verdict = "REVIVE_REWORK"
-                    decision_rules_fired.append("DECISION_FORCE_REWORK_LOW_CONFIDENCE")
+                    decision_rules_fired.append("DECISION_SUPPLY_RISK_REWORK")
+                else:
+                    verdict = "REVIVE_FAST"
+                    decision_rules_fired.append("DECISION_MARKET_OK_FAST")
+                    if force_rework:
+                        verdict = "REVIVE_REWORK"
+                        decision_rules_fired.append("DECISION_FORCE_REWORK_LOW_CONFIDENCE")
+            else:
+                decision_rules_fired.append("DECISION_LOCKED_BY_TYPE_GATE")
 
         low_conf_set = {"LOW_CONFIDENCE", "LOW_CONFIDENCE_PRICE", "LOW_CONFIDENCE_RELEVANCE", "REVIEWS_UNREACHABLE"}
         has_unknown = any("UNKNOWN" in safe_str(x) for x in set(risk_flags))
