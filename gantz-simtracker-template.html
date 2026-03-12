@@ -1,0 +1,679 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GANTZ SimTracker Template</title>
+  <style>
+    :root {
+      --bg-0: #0b0f14;
+      --bg-1: #111822;
+      --bg-2: #172231;
+      --glass: rgba(22, 31, 45, 0.86);
+      --line: rgba(145, 168, 196, 0.22);
+      --text: #e7edf6;
+      --muted: #9fb0c6;
+      --steel: #8ea3bf;
+      --calm: #58c3c0;
+      --warn: #d1a96b;
+      --danger: #cf6472;
+      --accent: #7aa2f7;
+      --revived: #8fd18e;
+      --radius: 14px;
+      --rail-w: 76px;
+      --panel-w: min(440px, calc(100vw - 110px));
+      --e: cubic-bezier(0.22, 0.61, 0.36, 1);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: radial-gradient(1200px 900px at 100% 10%, #182336 0%, var(--bg-0) 60%), var(--bg-0);
+      color: var(--text);
+      font: 14px/1.4 Inter, Segoe UI, Roboto, Arial, sans-serif;
+      min-height: 100vh;
+    }
+
+    .st-shell {
+      position: fixed;
+      top: 14px;
+      right: 14px;
+      bottom: 14px;
+      display: flex;
+      align-items: stretch;
+      z-index: 10;
+      pointer-events: none;
+    }
+
+    .st-drawer,
+    .st-rail {
+      pointer-events: auto;
+      border: 1px solid var(--line);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      background: linear-gradient(180deg, rgba(17, 24, 34, 0.92), rgba(12, 17, 24, 0.9));
+    }
+
+    .st-drawer {
+      width: var(--panel-w);
+      border-radius: var(--radius);
+      margin-right: 10px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      transform: translateX(6px);
+      opacity: 0.97;
+      transition: transform 220ms var(--e), opacity 220ms var(--e);
+      overflow: hidden;
+    }
+
+    .st-rail {
+      width: var(--rail-w);
+      border-radius: var(--radius);
+      padding: 10px 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+    }
+
+    .hud {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: linear-gradient(180deg, rgba(24, 34, 49, 0.7), rgba(16, 24, 36, 0.7));
+      padding: 10px;
+    }
+
+    .hud-title { font-size: 12px; color: var(--steel); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 8px; }
+    .hud-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 8px; font-size: 12px; }
+    .kv { display: flex; justify-content: space-between; gap: 8px; color: var(--muted); }
+    .kv b { color: var(--text); font-weight: 600; }
+    .tone-calm b { color: var(--calm); }
+    .tone-warn b { color: var(--warn); }
+    .tone-danger b { color: var(--danger); }
+
+    .card-wrap {
+      position: relative;
+      min-height: 0;
+      flex: 1;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: linear-gradient(180deg, rgba(19, 28, 40, 0.88), rgba(12, 18, 27, 0.88));
+    }
+
+    .entity-card {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      opacity: 0;
+      transform: translateX(18px) scale(0.995);
+      pointer-events: none;
+      transition: opacity 200ms var(--e), transform 240ms var(--e);
+      padding: 12px;
+      overflow-y: auto;
+      gap: 10px;
+    }
+
+    .entity-card.active {
+      opacity: 1;
+      transform: translateX(0) scale(1);
+      pointer-events: auto;
+    }
+
+    .entity-card.player { box-shadow: inset 0 0 0 1px rgba(122, 162, 247, 0.25); }
+    .entity-card.compact .metric-grid { grid-template-columns: 1fr; }
+
+    .hdr { display: flex; align-items: center; gap: 10px; }
+    .avatar {
+      width: 42px; height: 42px; border-radius: 11px;
+      display: grid; place-items: center;
+      font-size: 13px; font-weight: 700;
+      color: #f2f6ff;
+      border: 1px solid rgba(255,255,255,.16);
+      background: linear-gradient(160deg, #334968, #223347);
+      flex-shrink: 0;
+    }
+    .avatar.player { background: linear-gradient(160deg, #405b88, #2c3f5d); }
+
+    .title { font-size: 16px; font-weight: 650; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
+    .chip {
+      font-size: 11px; padding: 3px 8px; border-radius: 999px;
+      border: 1px solid var(--line); color: var(--steel);
+      background: rgba(17, 24, 35, 0.65);
+    }
+
+    .meta-row {
+      display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .meta-row > div {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      background: rgba(12, 18, 28, .55);
+    }
+
+    .tabs { display: flex; gap: 6px; }
+    .tab-btn {
+      flex: 1;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: rgba(17, 25, 36, .75);
+      color: var(--muted);
+      padding: 7px 10px;
+      font-weight: 620;
+      transition: all 170ms var(--e);
+      cursor: pointer;
+    }
+    .tab-btn:hover { color: var(--text); transform: translateY(-1px); }
+    .tab-btn.active {
+      color: #f4f7ff;
+      border-color: rgba(122, 162, 247, .45);
+      background: linear-gradient(180deg, rgba(58, 81, 119, .75), rgba(38, 56, 83, .7));
+    }
+
+    .tab-pane { display: none; animation: fadeSlide 220ms var(--e); }
+    .tab-pane.active { display: block; }
+    @keyframes fadeSlide { from { opacity: 0; transform: translateY(4px);} to { opacity:1; transform: translateY(0);} }
+
+    .metric-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px;
+      background: rgba(16, 24, 36, .66);
+    }
+    .metric-head { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-bottom: 5px; }
+    .bar {
+      height: 7px;
+      border-radius: 999px;
+      background: rgba(90, 113, 141, .2);
+      overflow: hidden;
+    }
+    .bar > i {
+      display: block;
+      height: 100%;
+      width: 0;
+      border-radius: inherit;
+      background: linear-gradient(90deg, #4ea0b7, #5cc6ca);
+      transition: width 240ms var(--e);
+    }
+
+    .flat-row {
+      margin-top: 8px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0,1fr));
+      gap: 6px;
+      font-size: 12px;
+    }
+    .flat-row span {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 6px 8px;
+      color: var(--steel);
+      background: rgba(13,20,30,.5);
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      overflow: hidden;
+    }
+
+    .sections { display: flex; flex-direction: column; gap: 8px; }
+    .section { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+    .section button {
+      width: 100%;
+      background: rgba(16,24,35,.85);
+      color: var(--text);
+      border: 0;
+      text-align: left;
+      padding: 8px 10px;
+      font-weight: 620;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .section button i { transition: transform 180ms var(--e); }
+    .section.open button i { transform: rotate(90deg); }
+    .section-body {
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 250ms var(--e), opacity 220ms var(--e);
+      opacity: 0;
+      background: rgba(12, 18, 27, .82);
+    }
+    .section.open .section-body { opacity: 1; }
+    .section-inner { padding: 9px 10px; color: var(--muted); font-size: 12px; display: grid; gap: 7px; }
+
+    .tags { display: flex; flex-wrap: wrap; gap: 6px; }
+    .tag { font-size: 11px; padding: 3px 7px; border-radius: 999px; border: 1px solid var(--line); color: var(--steel); }
+
+    .rail-item {
+      width: 100%;
+      border: 1px solid rgba(146, 168, 196, .24);
+      border-radius: 12px;
+      background: rgba(14, 20, 29, 0.88);
+      padding: 6px 4px;
+      display: grid;
+      justify-items: center;
+      gap: 5px;
+      color: var(--muted);
+      cursor: pointer;
+      transition: transform 180ms var(--e), border-color 180ms var(--e), background 180ms var(--e), opacity 180ms var(--e);
+      text-align: center;
+    }
+    .rail-item:hover {
+      transform: translateY(-2px);
+      border-color: rgba(122, 162, 247, .5);
+      color: var(--text);
+    }
+    .rail-item.active {
+      background: linear-gradient(180deg, rgba(51, 73, 104, .75), rgba(28, 42, 62, .75));
+      border-color: rgba(122, 162, 247, .7);
+      color: #f1f6ff;
+    }
+    .rail-item.player { border-color: rgba(122, 162, 247, .55); }
+    .rail-item.dead { filter: grayscale(.86); opacity: .7; }
+    .rail-item.inactive { opacity: .75; }
+    .rail-item.offscreen { opacity: .78; }
+    .rail-item .mini {
+      width: 34px; height: 34px; border-radius: 10px;
+      display: grid; place-items: center;
+      border: 1px solid rgba(255,255,255,.17);
+      background: linear-gradient(160deg, #2b3d56, #1f2f43);
+      font-size: 11px; font-weight: 700;
+    }
+    .rail-item .nm { font-size: 10px; line-height: 1.2; max-width: 56px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .rail-item .st { font-size: 9px; color: var(--steel); text-transform: uppercase; letter-spacing: .04em; }
+
+    .status-down .chip-status,
+    .status-dead .chip-status { border-color: rgba(207,100,114,.45); color: #ffb4bf; }
+    .status-revived .chip-status { border-color: rgba(143,209,142,.45); color: #bbf2bb; }
+
+    @media (max-width: 860px) {
+      .st-shell { left: 8px; right: 8px; top: 8px; bottom: 8px; }
+      :root { --panel-w: calc(100vw - 108px); }
+    }
+  </style>
+</head>
+<body>
+  <aside class="st-shell" id="simtracker"></aside>
+
+  <script id="demo-state" type="application/json">
+  {
+    "worldData": {
+      "mode": "mission",
+      "submode": "street_chase",
+      "story_date": "2009-04-14",
+      "story_time": "22:43",
+      "location": "Токио",
+      "sublocation": "мост у реки",
+      "active_cast": ["player", "kei_kurono", "rei_yoshino"],
+      "call_status": "deployed",
+      "countdown_visible": true,
+      "countdown_min": 3,
+      "mission_active": true,
+      "mission_id": "buddha_raid",
+      "mission_target": "гигант у храма",
+      "mission_timer_min": 11,
+      "threat_level": "high",
+      "public_heat": "medium",
+      "last_mission_result": "injured",
+      "scene_focus": "mixed"
+    },
+    "playerState": {
+      "id": "player",
+      "name": "Игрок",
+      "sex": "unknown",
+      "ui_variant": "neutral",
+      "icon_key": "player",
+      "tracked_tier": "primary",
+      "status": "active",
+      "presence": "mission",
+      "social": {"stress": 66, "exposure": 58, "comfort": 24, "isolation": 45, "arousal": 8, "bond_need": 52, "mask": "shaken"},
+      "combat": {
+        "health": 54,
+        "suit_integrity": 48,
+        "combat_readiness": 72,
+        "panic": 63,
+        "aggression": 57,
+        "role": "frontliner",
+        "weapon": "x_gun",
+        "position": "behind_cover",
+        "injuries": [{"key": "rib_fracture", "label": "трещина ребра", "severity": "moderate", "treated": false}],
+        "downed": false
+      },
+      "gantz": {"participant": true, "score": 17, "room_status": "deployed", "revivable": true},
+      "story": {"goal_short": "дожить до конца таймера", "goal_long": "собрать костяк команды", "internal_thought": "Нельзя терять темп.", "flags": ["mission_shaken"]},
+      "relations": {"notable_links": [{"target_id": "kei_kurono", "bond": "teammate", "trust": 48, "tension": 26}]}
+    },
+    "characters": [
+      {
+        "id": "kei_kurono",
+        "name": "Кэй Куроно",
+        "sex": "male",
+        "ui_variant": "male",
+        "icon_key": "kei_kurono",
+        "tracked_tier": "major",
+        "status": "active",
+        "presence": "mission",
+        "social": {"trust": 41, "attraction": 7, "tension": 68, "jealousy": 13, "comfort": 29, "intimacy": 18, "mask": "guarded"},
+        "combat": {
+          "health": 62,
+          "suit_integrity": 71,
+          "combat_readiness": 80,
+          "panic": 39,
+          "aggression": 76,
+          "role": "leader",
+          "weapon": "gantz_sword",
+          "position": "melee_range",
+          "injuries": [],
+          "downed": false
+        },
+        "gantz": {"participant": true, "score": 43, "room_status": "deployed", "revivable": true},
+        "story": {"goal_short": "продавить цель", "goal_long": "остаться незаменимым", "internal_thought": "Никто не должен видеть слабость.", "flags": ["leader_strain"]},
+        "relations": {
+          "to_player": {"trust": 38, "attraction": 6, "tension": 44, "jealousy": 9, "bond_label": "teammate"},
+          "notable_links": [{"target_id": "player", "bond": "teammate", "trust": 38, "tension": 44}]
+        }
+      },
+      {
+        "id": "rei_yoshino",
+        "name": "Рэй Ёшино",
+        "sex": "female",
+        "ui_variant": "female",
+        "icon_key": "rei_yoshino",
+        "tracked_tier": "support",
+        "status": "inactive",
+        "presence": "offscreen",
+        "social": {"trust": 58, "attraction": 15, "tension": 21, "jealousy": 0, "comfort": 64, "intimacy": 36, "mask": "composed"},
+        "combat": {
+          "health": 83,
+          "suit_integrity": 92,
+          "combat_readiness": 33,
+          "panic": 17,
+          "aggression": 12,
+          "role": "support",
+          "weapon": "y_gun",
+          "position": "safe",
+          "injuries": [],
+          "downed": false
+        },
+        "gantz": {"participant": true, "score": 12, "room_status": "returned", "revivable": true},
+        "story": {"goal_short": "переждать пик", "goal_long": "сохранить себя", "internal_thought": "Сейчас лучше не светиться.", "flags": ["keeping_secret"]},
+        "relations": {
+          "to_player": {"trust": 58, "attraction": 15, "tension": 21, "jealousy": 0, "bond_label": "ally"},
+          "notable_links": []
+        }
+      },
+      {
+        "id": "old_hunter",
+        "name": "Старый охотник",
+        "sex": "male",
+        "ui_variant": "male",
+        "icon_key": "old_hunter",
+        "tracked_tier": "temporary",
+        "status": "dead",
+        "presence": "location_unknown",
+        "social": {"trust": 10, "attraction": 0, "tension": 5, "jealousy": 0, "comfort": 2, "intimacy": 1, "mask": "detached"},
+        "combat": {
+          "health": 0,
+          "suit_integrity": 0,
+          "combat_readiness": 0,
+          "panic": 0,
+          "aggression": 0,
+          "role": "objective",
+          "weapon": "unknown",
+          "position": "downed",
+          "injuries": [{"key": "fatal_trauma", "label": "фатальное поражение", "severity": "critical", "treated": false}],
+          "downed": true
+        },
+        "gantz": {"participant": true, "score": 0, "room_status": "eliminated", "revivable": false},
+        "story": {"goal_short": "", "goal_long": "", "internal_thought": "", "flags": ["death_marked"]},
+        "relations": {
+          "to_player": {"trust": 10, "attraction": 0, "tension": 11, "jealousy": 0, "bond_label": "acquaintance"},
+          "notable_links": []
+        }
+      }
+    ]
+  }
+  </script>
+
+  <script>
+    (function () {
+      const host = document.getElementById('simtracker');
+      const state = window.simTrackerState || JSON.parse(document.getElementById('demo-state').textContent);
+      const world = state.worldData || {};
+      const entities = [state.playerState, ...(state.characters || [])].filter(Boolean);
+
+      const rank = (e) => {
+        if (e.id === 'player') return 0;
+        if (e.status === 'dead') return 60;
+        if (e.status === 'inactive') return 50;
+        if (e.presence === 'offscreen') return 40;
+        const t = { major: 10, support: 20, temporary: 30 }[e.tracked_tier] || 35;
+        return t;
+      };
+
+      const sorted = [...entities].sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name), 'ru'));
+
+      const initialTab = (e) => {
+        const focus = world.scene_focus;
+        if (focus === 'social') return 'social';
+        if (focus === 'combat') return 'combat';
+        const severe = (e.combat?.injuries || []).some(i => i.severity === 'severe' || i.severity === 'critical');
+        return (e.combat?.downed || severe) ? 'combat' : 'social';
+      };
+
+      const initials = (name) => String(name || '?').split(/\s+/).slice(0, 2).map(s => s[0] || '').join('').toUpperCase();
+      const clamp = (v) => Math.max(0, Math.min(100, Number(v) || 0));
+      const toneFor = (k, v) => {
+        if (["threat_level", "public_heat"].includes(k)) {
+          if (["extreme", "critical", "high"].includes(String(v))) return 'tone-danger';
+          if (String(v) === 'medium') return 'tone-warn';
+          return 'tone-calm';
+        }
+        if (k === 'scene_focus' && v === 'combat') return 'tone-warn';
+        return '';
+      };
+
+      host.innerHTML = `
+        <section class="st-drawer">
+          <div class="hud" id="hud"></div>
+          <div class="card-wrap" id="cards"></div>
+        </section>
+        <nav class="st-rail" id="rail" aria-label="Entities"></nav>
+      `;
+
+      const hudPairs = [
+        ['mode', world.mode],
+        ['submode', world.submode],
+        ['date', world.story_date],
+        ['time', world.story_time],
+        ['location', world.location],
+        ['sublocation', world.sublocation],
+        ['call', world.call_status],
+        [world.countdown_visible ? 'countdown' : null, world.countdown_visible ? `${world.countdown_min}m` : null],
+        [world.mission_active ? 'mission_timer' : null, world.mission_active ? `${world.mission_timer_min}m` : null],
+        ['threat', world.threat_level],
+        ['public_heat', world.public_heat],
+        ['scene_focus', world.scene_focus]
+      ].filter(([k, v]) => k && v !== undefined && v !== null);
+
+      document.getElementById('hud').innerHTML = `
+        <div class="hud-title">World HUD</div>
+        <div class="hud-grid">
+          ${hudPairs.map(([k, v]) => `<div class="kv ${toneFor(k, v)}"><span>${k}</span><b>${v}</b></div>`).join('')}
+        </div>
+      `;
+
+      const socialPlayer = ['stress','exposure','comfort','isolation','arousal','bond_need'];
+      const socialNpc = ['trust','attraction','tension','jealousy','comfort','intimacy'];
+      const combatM = ['health','suit_integrity','combat_readiness','panic','aggression'];
+
+      const rail = document.getElementById('rail');
+      const cards = document.getElementById('cards');
+
+      const metric = (k, v) => `
+        <div class="metric">
+          <div class="metric-head"><span>${k}</span><span>${clamp(v)}</span></div>
+          <div class="bar"><i style="width:${clamp(v)}%"></i></div>
+        </div>
+      `;
+
+      const renderLinks = (e) => {
+        if (e.id === 'player') {
+          const links = e.relations?.notable_links || [];
+          return links.length ? links.map(l => `<div>${l.target_id}: ${l.bond} · trust ${l.trust} · tension ${l.tension}</div>`).join('') : '<div>нет значимых связей</div>';
+        }
+        const to = e.relations?.to_player;
+        const notable = e.relations?.notable_links || [];
+        return `
+          ${to ? `<div>to_player: ${to.bond_label} · trust ${to.trust} · tension ${to.tension}</div>` : '<div>to_player: нет данных</div>'}
+          ${notable.length ? notable.map(l => `<div>${l.target_id}: ${l.bond} · trust ${l.trust} · tension ${l.tension}</div>`).join('') : '<div>notable_links: пусто</div>'}
+        `;
+      };
+
+      sorted.forEach((e, idx) => {
+        const socialSet = e.id === 'player' ? socialPlayer : socialNpc;
+        const compact = e.tracked_tier === 'temporary' || e.presence === 'offscreen' || e.status === 'inactive' || e.status === 'dead';
+        const badgeCls = [e.status, e.presence].filter(Boolean).map(s => s.replace(/_/g,'-')).join(' ');
+        const metaBond = e.id === 'player'
+          ? (e.relations?.notable_links?.[0]?.bond || 'self_tracked')
+          : (e.relations?.to_player?.bond_label || 'unknown');
+
+        rail.insertAdjacentHTML('beforeend', `
+          <button class="rail-item ${e.id === 'player' ? 'player' : ''} ${e.status || ''} ${e.presence || ''}" data-entity="${e.id}">
+            <span class="mini">${initials(e.name)}</span>
+            <span class="nm">${e.name}</span>
+            <span class="st">${e.status}</span>
+          </button>
+        `);
+
+        cards.insertAdjacentHTML('beforeend', `
+          <article class="entity-card ${e.id === 'player' ? 'player' : ''} ${compact ? 'compact' : ''} status-${e.status || ''}" data-card="${e.id}">
+            <header class="hdr">
+              <div class="avatar ${e.id === 'player' ? 'player' : ''}">${initials(e.name)}</div>
+              <div style="min-width:0;flex:1;">
+                <div class="title">${e.name}</div>
+                <div class="chips">
+                  <span class="chip">${e.tracked_tier || 'primary'}</span>
+                  <span class="chip chip-status">${e.status}</span>
+                  <span class="chip">${e.presence}</span>
+                </div>
+              </div>
+            </header>
+
+            <div class="meta-row ${badgeCls}">
+              <div>role: <b>${e.combat?.role || 'unassigned'}</b></div>
+              <div>room: <b>${e.gantz?.room_status || 'inactive'}</b></div>
+              <div>bond: <b>${metaBond}</b></div>
+              <div>crisis: <b>${(e.combat?.downed || (e.combat?.health||0) <= 24) ? 'high' : 'stable'}</b></div>
+            </div>
+
+            <div class="tabs">
+              <button class="tab-btn" data-tab="social">Social</button>
+              <button class="tab-btn" data-tab="combat">Combat</button>
+            </div>
+
+            <section class="tab-pane" data-pane="social">
+              <div class="metric-grid">
+                ${socialSet.map(k => metric(k, e.social?.[k])).join('')}
+              </div>
+              <div class="flat-row"><span>mask: ${e.social?.mask || 'unknown'}</span></div>
+            </section>
+
+            <section class="tab-pane" data-pane="combat">
+              <div class="metric-grid">
+                ${combatM.map(k => metric(k, e.combat?.[k])).join('')}
+              </div>
+              <div class="flat-row">
+                <span>role: ${e.combat?.role || 'unassigned'}</span>
+                <span>weapon: ${e.combat?.weapon || 'unknown'}</span>
+                <span>position: ${e.combat?.position || 'unknown'}</span>
+                <span>downed: ${e.combat?.downed ? 'yes' : 'no'}</span>
+              </div>
+              <div class="tags" style="margin-top:6px;">
+                ${(e.combat?.injuries || []).length
+                  ? e.combat.injuries.map(i => `<span class="tag">${i.label} · ${i.severity}${i.treated ? ' · treated' : ''}</span>`).join('')
+                  : '<span class="tag">injuries: none</span>'}
+              </div>
+            </section>
+
+            <div class="sections">
+              <div class="section" data-collapsible>
+                <button type="button">Story <i>▸</i></button>
+                <div class="section-body"><div class="section-inner">
+                  <div>goal_short: ${e.story?.goal_short || '—'}</div>
+                  <div>goal_long: ${e.story?.goal_long || '—'}</div>
+                  <div>internal: ${e.story?.internal_thought || '—'}</div>
+                  <div class="tags">${(e.story?.flags || []).length ? e.story.flags.map(f => `<span class="tag">${f}</span>`).join('') : '<span class="tag">flags: none</span>'}</div>
+                </div></div>
+              </div>
+
+              <div class="section" data-collapsible>
+                <button type="button">Gantz <i>▸</i></button>
+                <div class="section-body"><div class="section-inner">
+                  <div>participant: ${e.gantz?.participant ? 'yes' : 'no'}</div>
+                  <div>score: ${e.gantz?.score ?? 0}</div>
+                  <div>room_status: ${e.gantz?.room_status || 'inactive'}</div>
+                  <div>revivable: ${e.gantz?.revivable ? 'yes' : 'no'}</div>
+                </div></div>
+              </div>
+
+              <div class="section" data-collapsible>
+                <button type="button">Links <i>▸</i></button>
+                <div class="section-body"><div class="section-inner">${renderLinks(e)}</div></div>
+              </div>
+            </div>
+          </article>
+        `);
+
+        const card = cards.querySelector(`[data-card="${e.id}"]`);
+        const tab = initialTab(e);
+        card.querySelectorAll('.tab-btn').forEach(btn => btn.classList.toggle('active', btn.dataset.tab === tab));
+        card.querySelectorAll('.tab-pane').forEach(p => p.classList.toggle('active', p.dataset.pane === tab));
+
+        card.querySelectorAll('.tab-btn').forEach(btn => {
+          btn.addEventListener('click', () => {
+            card.querySelectorAll('.tab-btn').forEach(x => x.classList.toggle('active', x === btn));
+            card.querySelectorAll('.tab-pane').forEach(x => x.classList.toggle('active', x.dataset.pane === btn.dataset.tab));
+          });
+        });
+
+        card.querySelectorAll('[data-collapsible]').forEach((sec, sidx) => {
+          const trigger = sec.querySelector('button');
+          const body = sec.querySelector('.section-body');
+          if (sidx === 0 && !compact) {
+            sec.classList.add('open');
+            body.style.maxHeight = body.scrollHeight + 'px';
+          }
+          trigger.addEventListener('click', () => {
+            const open = sec.classList.toggle('open');
+            body.style.maxHeight = open ? body.scrollHeight + 'px' : '0px';
+          });
+        });
+
+        if (idx === 0) {
+          card.classList.add('active');
+          rail.querySelector(`[data-entity="${e.id}"]`)?.classList.add('active');
+        }
+      });
+
+      rail.querySelectorAll('.rail-item').forEach(btn => {
+        btn.addEventListener('click', () => {
+          const id = btn.dataset.entity;
+          rail.querySelectorAll('.rail-item').forEach(x => x.classList.toggle('active', x === btn));
+          cards.querySelectorAll('.entity-card').forEach(x => x.classList.toggle('active', x.dataset.card === id));
+        });
+      });
+    })();
+  </script>
+</body>
+</html>
