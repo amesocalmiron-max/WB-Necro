@@ -1,0 +1,438 @@
+{
+  "preset_id": "gantz_simtracker_v1",
+  "preset_type": "simtracker",
+  "title": "GANTZ SimTracker Preset",
+  "version": "1.0.0",
+  "description": "Authoritative runtime state preset for GANTZ GM continuity.",
+  "output_contract": {
+    "block_tag": "disp",
+    "format": "strict_json",
+    "requirements": [
+      "Output exactly one JSON disp block.",
+      "No narrative text after the final disp block.",
+      "Most recent valid disp block is authoritative state input for next update."
+    ]
+  },
+  "root_model": {
+    "required": [
+      "worldData",
+      "playerState",
+      "characters"
+    ],
+    "shape": {
+      "worldData": {},
+      "playerState": {},
+      "characters": []
+    },
+    "invariants": [
+      "Root state must remain exactly worldData + playerState + characters.",
+      "playerState must always exist.",
+      "Player entity must not be duplicated in characters[]."
+    ]
+  },
+  "state_schema": {
+    "worldData": {
+      "required": [
+        "mode",
+        "submode",
+        "story_date",
+        "story_time",
+        "location",
+        "sublocation",
+        "active_cast",
+        "call_status",
+        "countdown_visible",
+        "countdown_min",
+        "mission_active",
+        "mission_id",
+        "mission_target",
+        "mission_timer_min",
+        "threat_level",
+        "public_heat",
+        "last_mission_result",
+        "scene_focus"
+      ],
+      "enums": {
+        "mode": ["daily", "room", "mission", "aftermath"],
+        "call_status": ["silent", "foreshadowed", "called", "in_room", "deployed", "returning"],
+        "threat_level": ["low", "medium", "high", "extreme"],
+        "public_heat": ["low", "medium", "high", "critical"],
+        "last_mission_result": ["none", "survived", "injured", "failed", "partial_success", "wiped"],
+        "scene_focus": ["social", "combat", "mixed"]
+      },
+      "rules": [
+        "story_date and story_time are in-world chronology fields.",
+        "submode is a controlled open snake_case string.",
+        "active_cast contains only currently present or actively influencing entities."
+      ]
+    },
+    "playerState": {
+      "required": [
+        "id",
+        "name",
+        "sex",
+        "ui_variant",
+        "icon_key",
+        "tracked_tier",
+        "status",
+        "presence",
+        "social",
+        "combat",
+        "gantz",
+        "story",
+        "relations"
+      ],
+      "constants": {
+        "id": "player",
+        "tracked_tier": "primary"
+      },
+      "enums": {
+        "sex": ["male", "female", "unknown"],
+        "ui_variant": ["male", "female", "neutral", "custom"],
+        "status": ["active", "inactive", "missing", "down", "dead", "revived"],
+        "presence": ["onscreen", "offscreen", "room", "mission", "location_unknown"]
+      },
+      "social": {
+        "required": ["stress", "exposure", "comfort", "isolation", "arousal", "bond_need", "mask"],
+        "enums": {
+          "mask": ["closed", "guarded", "neutral", "open", "friendly", "performative", "cold", "detached", "composed", "shaken", "cracked"]
+        }
+      },
+      "combat": {
+        "required": ["health", "suit_integrity", "combat_readiness", "panic", "aggression", "role", "weapon", "position", "injuries", "downed"],
+        "enums": {
+          "role": ["unassigned", "civilian", "leader", "frontliner", "shooter", "support", "scout", "protector", "wildcard", "objective"],
+          "weapon": ["none", "x_gun", "x_shotgun", "y_gun", "gantz_sword", "improvised", "unknown"],
+          "position": ["safe", "exposed", "behind_cover", "melee_range", "mid_range", "long_range", "flanking", "elevated", "retreating", "cornered", "restrained", "downed", "lost_contact"]
+        },
+        "injuries": {
+          "type": "array_of_objects",
+          "entry_required": ["key", "label", "severity", "treated"],
+          "severity_enum": ["minor", "moderate", "severe", "critical"],
+          "rule": "Plain string injury entries are forbidden."
+        }
+      },
+      "gantz": {
+        "required": ["participant", "score", "room_status", "revivable"],
+        "enums": {
+          "room_status": ["inactive", "summoned", "briefed", "deployed", "returned", "eliminated"]
+        }
+      },
+      "story": {
+        "required": ["goal_short", "goal_long", "internal_thought", "flags"],
+        "flags_allowed": [
+          "under_watch",
+          "keeping_secret",
+          "identity_strain",
+          "trauma_active",
+          "mission_shaken",
+          "grief_locked",
+          "vengeful",
+          "fixated",
+          "avoidant",
+          "group_anchor",
+          "leader_strain",
+          "death_marked",
+          "unstable",
+          "isolating",
+          "protective_drive"
+        ],
+        "rules": [
+          "Maximum 3 active flags.",
+          "goal_short can shift with current scene.",
+          "goal_long changes rarely.",
+          "internal_thought should remain short."
+        ]
+      },
+      "relations": {
+        "required": ["notable_links"],
+        "notable_links_entry": {
+          "required": ["target_id", "bond", "trust", "tension"]
+        },
+        "rules": [
+          "Keep only significant links.",
+          "Typical count is 1 to 3 links."
+        ]
+      }
+    },
+    "characters": {
+      "type": "array",
+      "entity_required": [
+        "id",
+        "name",
+        "sex",
+        "ui_variant",
+        "icon_key",
+        "tracked_tier",
+        "status",
+        "presence",
+        "social",
+        "combat",
+        "gantz",
+        "story",
+        "relations"
+      ],
+      "enums": {
+        "tracked_tier": ["major", "support", "temporary"],
+        "sex": ["male", "female", "unknown"],
+        "ui_variant": ["male", "female", "neutral", "custom"],
+        "status": ["active", "inactive", "missing", "down", "dead", "revived"],
+        "presence": ["onscreen", "offscreen", "room", "mission", "location_unknown"]
+      },
+      "social": {
+        "required": ["trust", "attraction", "tension", "jealousy", "comfort", "intimacy", "mask"],
+        "enums": {
+          "mask": ["closed", "guarded", "neutral", "open", "friendly", "performative", "cold", "detached", "composed", "shaken", "cracked"]
+        },
+        "rules": [
+          "social stores current scene state.",
+          "Do not add bond_label under social."
+        ]
+      },
+      "combat": {
+        "required": ["health", "suit_integrity", "combat_readiness", "panic", "aggression", "role", "weapon", "position", "injuries", "downed"],
+        "enums": {
+          "role": ["unassigned", "civilian", "leader", "frontliner", "shooter", "support", "scout", "protector", "wildcard", "objective"],
+          "weapon": ["none", "x_gun", "x_shotgun", "y_gun", "gantz_sword", "improvised", "unknown"],
+          "position": ["safe", "exposed", "behind_cover", "melee_range", "mid_range", "long_range", "flanking", "elevated", "retreating", "cornered", "restrained", "downed", "lost_contact"]
+        },
+        "injuries": {
+          "type": "array_of_objects",
+          "entry_required": ["key", "label", "severity", "treated"],
+          "severity_enum": ["minor", "moderate", "severe", "critical"]
+        }
+      },
+      "gantz": {
+        "required": ["participant", "score", "room_status", "revivable"],
+        "enums": {
+          "room_status": ["inactive", "summoned", "briefed", "deployed", "returned", "eliminated"]
+        }
+      },
+      "story": {
+        "required": ["goal_short", "goal_long", "internal_thought", "flags"],
+        "flags_allowed": [
+          "under_watch",
+          "keeping_secret",
+          "identity_strain",
+          "trauma_active",
+          "mission_shaken",
+          "grief_locked",
+          "vengeful",
+          "fixated",
+          "avoidant",
+          "group_anchor",
+          "leader_strain",
+          "death_marked",
+          "unstable",
+          "isolating",
+          "protective_drive"
+        ],
+        "rules": ["Maximum 3 active flags."]
+      },
+      "relations": {
+        "required": ["to_player", "notable_links"],
+        "to_player_required": ["trust", "attraction", "tension", "jealousy", "bond_label"],
+        "bond_label_enum": [
+          "stranger",
+          "acquaintance",
+          "classmate",
+          "teammate",
+          "uneasy_ally",
+          "ally",
+          "trusted",
+          "protective",
+          "dependent",
+          "romantic_tension",
+          "intimate",
+          "rival",
+          "hostile",
+          "fractured",
+          "obsessed"
+        ],
+        "rules": [
+          "bond_label exists only in relations.to_player.",
+          "relations.to_player is long-lived memory relative to player.",
+          "social and relations.to_player may diverge without conflict."
+        ]
+      }
+    }
+  },
+  "language_policy": {
+    "json_keys": "english",
+    "enum_values": "english",
+    "short_text_fields": "russian",
+    "id_format": "english_snake_case",
+    "icon_key_format": "english_snake_case"
+  },
+  "meter_policy": {
+    "default_numeric_range": "0..100",
+    "bands": {
+      "0_10": "почти отсутствует",
+      "11_30": "слабый уровень",
+      "31_55": "заметный/рабочий",
+      "56_75": "высокий",
+      "76_90": "очень высокий",
+      "91_100": "экстремальный"
+    },
+    "health_and_suit_integrity": {
+      "100": "полностью рабочее состояние",
+      "75_99": "лёгкие повреждения",
+      "50_74": "заметные повреждения",
+      "25_49": "тяжёлая деградация",
+      "1_24": "критическое состояние",
+      "0": "мёртв / разрушен / выведен из строя"
+    }
+  },
+  "lifecycle_rules": {
+    "create_npc_card_when": [
+      "Entity has stable identity.",
+      "Entity entered active scene.",
+      "Entity can recur.",
+      "Entity influences player, group, or arc.",
+      "Entity is not disposable extra."
+    ],
+    "do_not_create_for": [
+      "Random passersby.",
+      "Background students.",
+      "Unnamed crowd.",
+      "One-off extras without ongoing relevance."
+    ],
+    "tier_upgrade": "temporary -> support -> major when repeated and narratively relevant.",
+    "offscreen_policy": "Preserve card, usually set presence=offscreen, optionally status=inactive.",
+    "death_policy": "If dead: status=dead and combat.health=0; keep entity card.",
+    "revive_policy": "If canon return: status=revived; health > 0 only with explicit scene basis; do not erase history."
+  },
+  "updater_contract": {
+    "role": [
+      "Conservative state updater",
+      "Continuity worker",
+      "Schema preserver"
+    ],
+    "not_role": [
+      "Narrator",
+      "Lore writer",
+      "Improvisational designer"
+    ],
+    "required_behavior": [
+      "Read most recent valid disp block as authoritative input.",
+      "Preserve values unless scene justifies change.",
+      "Self-correct missing keys conservatively.",
+      "Never invent new keys.",
+      "Never remove important dead/offscreen entities.",
+      "Track player explicitly.",
+      "Update only fields truly affected by scene.",
+      "Output exactly one strict JSON disp block."
+    ],
+    "user_input_authority": "Do not independently decide authority of {{user}} prose; follow active build and role adapter resolution.",
+    "conservative_discipline": {
+      "principle": "Preserve unless justified.",
+      "fast_fields": ["panic", "aggression", "stress", "exposure", "combat_readiness", "position", "health", "suit_integrity"],
+      "medium_fields": ["trust", "intimacy", "bond_need", "isolation", "jealousy", "relations.to_player.*"],
+      "rare_fields": ["mask", "bond_label", "tracked_tier", "status", "goal_long"],
+      "forbidden_without_justification": [
+        "trust +20 from one pleasant talk",
+        "intimacy +25 from one accidental touch",
+        "panic -> 0 immediately after massacre",
+        "health +30 without treatment",
+        "suit_integrity +40 without repair",
+        "deleting important dead NPC"
+      ]
+    }
+  },
+  "validation": {
+    "must_check": [
+      "worldData exists",
+      "playerState exists",
+      "characters exists",
+      "no duplicate IDs",
+      "player exists exactly once and only in playerState",
+      "enum values valid",
+      "numeric values capped",
+      "no forbidden keys outside schema"
+    ],
+    "fallback_policy": [
+      "Attempt safe normalize or repair if reliable.",
+      "Otherwise return previous valid state.",
+      "Prefer old valid state over new malformed state."
+    ]
+  },
+  "forbidden_legacy_fields": [
+    "affinity",
+    "desire",
+    "reactionIcon",
+    "connections",
+    "belongings",
+    "goals",
+    "bg",
+    "inactiveReason"
+  ],
+  "default_state": {
+    "worldData": {
+      "mode": "daily",
+      "submode": "school_day",
+      "story_date": "2009-04-14",
+      "story_time": "16:20",
+      "location": "Токио",
+      "sublocation": "школьный коридор",
+      "active_cast": ["player"],
+      "call_status": "silent",
+      "countdown_visible": false,
+      "countdown_min": 0,
+      "mission_active": false,
+      "mission_id": "none",
+      "mission_target": "нет",
+      "mission_timer_min": 0,
+      "threat_level": "low",
+      "public_heat": "low",
+      "last_mission_result": "none",
+      "scene_focus": "social"
+    },
+    "playerState": {
+      "id": "player",
+      "name": "Игрок",
+      "sex": "unknown",
+      "ui_variant": "neutral",
+      "icon_key": "player",
+      "tracked_tier": "primary",
+      "status": "active",
+      "presence": "onscreen",
+      "social": {
+        "stress": 20,
+        "exposure": 15,
+        "comfort": 40,
+        "isolation": 35,
+        "arousal": 5,
+        "bond_need": 30,
+        "mask": "guarded"
+      },
+      "combat": {
+        "health": 100,
+        "suit_integrity": 100,
+        "combat_readiness": 15,
+        "panic": 10,
+        "aggression": 10,
+        "role": "unassigned",
+        "weapon": "none",
+        "position": "safe",
+        "injuries": [],
+        "downed": false
+      },
+      "gantz": {
+        "participant": false,
+        "score": 0,
+        "room_status": "inactive",
+        "revivable": true
+      },
+      "story": {
+        "goal_short": "дожить до вечера",
+        "goal_long": "понять правила игры",
+        "internal_thought": "Пока рано доверять всем подряд.",
+        "flags": []
+      },
+      "relations": {
+        "notable_links": []
+      }
+    },
+    "characters": []
+  }
+}
