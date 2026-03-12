@@ -279,6 +279,7 @@
       color: #f1f6ff;
     }
     .rail-item.player { border-color: rgba(122, 162, 247, .55); }
+    .rail-item.down { border-color: rgba(207,100,114,.5); }
     .rail-item.dead { filter: grayscale(.86); opacity: .7; }
     .rail-item.inactive { opacity: .75; }
     .rail-item.offscreen { opacity: .78; }
@@ -291,6 +292,9 @@
     }
     .rail-item .nm { font-size: 10px; line-height: 1.2; max-width: 56px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .rail-item .st { font-size: 9px; color: var(--steel); text-transform: uppercase; letter-spacing: .04em; }
+    .rail-item .sig { font-size: 9px; color: var(--warn); letter-spacing: .03em; }
+    .rail-item.down .sig,
+    .rail-item.dead .sig { color: #ffb4bf; }
 
     .status-down .chip-status,
     .status-dead .chip-status { border-color: rgba(207,100,114,.45); color: #ffb4bf; }
@@ -463,6 +467,16 @@
 
       const sorted = [...entities].sort((a, b) => rank(a) - rank(b) || String(a.name).localeCompare(String(b.name), 'ru'));
 
+      const criticalHint = (e) => {
+        const injuries = e.combat?.injuries || [];
+        const severe = injuries.some(i => i.severity === 'severe' || i.severity === 'critical');
+        if (e.status === 'dead') return 'dead';
+        if (e.status === 'down' || e.combat?.downed) return 'down';
+        if (severe) return 'critical';
+        if (e.presence === 'offscreen') return 'offscreen';
+        return 'stable';
+      };
+
       const initialTab = (e) => {
         const focus = world.scene_focus;
         if (focus === 'social') return 'social';
@@ -553,6 +567,7 @@
             <span class="mini">${initials(e.name)}</span>
             <span class="nm">${e.name}</span>
             <span class="st">${e.status}</span>
+            <span class="sig">${criticalHint(e)}</span>
           </button>
         `);
 
